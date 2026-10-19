@@ -1,0 +1,364 @@
+// Osysharp.Llm — the call path: a call is switched, routed, served, and metered at the price in force; a provider that
+// fails hands the call to the router's next model; and the meter is the kit's alone to write.
+using Osysharp.Llm;
+using SeedBank;
+
+// ── served, and metered ─────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Bank)]
+[runas(Ines)]
+void a_call_is_served_by_the_routers_first_model_and_metered_at_its_price() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("Early beans, saved in 2024.", 1000, 200));
+  Assert.Equal("Early beans, saved in 2024.", Summarise("Early dwarf beans, saved from the 2024 crop, dry stored."));
+
+  var row = ModelCall.Single();
+  Assert.Equal("Small", row.Model);
+  Assert.Equal("scripted-small", row.ProviderModel);
+  Assert.Equal(ModelCallKind.Complete, row.Kind);
+  Assert.Equal(ModelCallOutcome.Served, row.Outcome);
+  Assert.Equal(1000, row.InputTokens);
+  Assert.Equal(200, row.OutputTokens);
+  // 1000 tokens at $1 a million and 200 at $5: 1000 + 1000 millionths of a dollar.
+  Assert.Equal(2000, row.CostMicros);
+  Assert.Equal("seed-bank:1", row.RouteRule);
+  Assert.Equal(Ines.Id, row.Requester);
+}
+
+[Test(Bank)]
+[runas(Ines)]
+void two_calls_started_together_are_both_in_flight_and_each_is_metered() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("About " + Scripted.Asked(request), 1000, 200));
+  var beans = Llm.Complete("beans");                 // started — not waited for here
+  var oats  = Llm.Complete("oats");                  // started too
+  Assert.Equal("About beans", await beans);
+  Assert.Equal("About oats", await oats);
+  Assert.Equal(2, ModelCall.Count(c => c.Outcome == ModelCallOutcome.Served));
+  Assert.Equal(4000, ModelCall.ToList().Sum(c => c.CostMicros));
+}
+
+[Test(Bank)]
+[runas(Ines)]
+void a_call_that_is_started_and_refused_fails_where_it_is_awaited() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("Never said."));
+  var refused = Llm.Complete("beans", "Enormous");    // a model the app does not have
+  Assert.Throws<LlmRouteDenied>(() => await refused);
+}
+
+[Test(Bank)]
+[runas(Ines)]
+void the_provider_is_sent_its_own_id_for_the_model_never_the_apps_name() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text(model + " was sent " + request.Model));
+  Assert.Equal("Small was sent scripted-small", Summarise("beans"));
+}
+
+[Test(Bank)]
+[runas(Ines)]
+void a_call_said_in_full_records_what_it_is_for_and_what_it_is_charged_to() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("Beans.", 400, 100));
+  var result = SummariseFor("A1", "Early dwarf beans.");
+  Assert.Equal("Beans.", result.Text());
+  Assert.Equal("Small", result.Model);
+  Assert.Equal(900, result.CostMicros);
+  Assert.Equal(1, result.Attempts);
+
+  var row = ModelCall.Single(c => c.Call == result.Call);
+  Assert.Equal("catalogue line", row.Purpose);
+  Assert.Contains("lot:A1", row.Scopes);
+  Assert.Contains("app:", row.Scopes);
+  Assert.Contains("model:Small", row.Scopes);
+  Assert.Contains("requester:" + Ines.Id.ToString(), row.Scopes);
+  // What the lot's calls cost in all, read from the meter: $0.0009.
+  Assert.Equal(0.0009m, SpentOn("lot:A1"));
+  Assert.Equal(0m, SpentOn("lot:B2"));
+}
+
+[Test(Bank)]
+[runas(Ines)]
+void the_facts_the_router_decided_from_are_kept_with_the_call() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("Yes."));
+  Scrutinise("Is a ten-year-old bean still viable?");
+  var row = ModelCall.Single();
+  Assert.Equal("Large", row.Model);
+  var facts = JsonSerializer.Deserialize<LlmTaskFacts>(row.Facts!);
+  Assert.Equal(2, facts.MinQuality);
+  Assert.Equal(LlmTaskKind.Generate, facts.Kind);
+  Assert.True(facts.InputTokens > 0);
+}
+
+// ── the walk ────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Bank)]
+[runas(Ines)]
+void a_fallback_walks_the_routers_order_and_meters_each_attempt() {
+  ScriptedAnswer.Stub((model, request) => {
+    if (model == "Small") { throw new ExternalServiceException("scripted-small answered 529: overloaded"); }
+    return Scripted.Text("Beans, from the large model.", 1000, 200);
+  });
+  var result = SummariseFor("A1", "Early dwarf beans.");
+  Assert.Equal("Beans, from the large model.", result.Text());
+  Assert.Equal("Large", result.Model);
+  Assert.Equal(2, result.Attempts);
+
+  var attempts = ModelCall.Where(c => c.Call == result.Call).OrderBy(c => c.Attempt).ToList();
+  Assert.Equal(2, attempts.Count);
+  Assert.Equal("Small", attempts[0].Model);
+  Assert.Equal(ModelCallOutcome.Failed, attempts[0].Outcome);
+  Assert.Equal("scripted-small answered 529: overloaded", attempts[0].Problem);
+  Assert.Equal(0, attempts[0].CostMicros);
+  Assert.Null(attempts[0].FallbackFrom);
+  Assert.Equal("Large", attempts[1].Model);
+  Assert.Equal(ModelCallOutcome.Served, attempts[1].Outcome);
+  Assert.Equal("Small", attempts[1].FallbackFrom);
+  Assert.Equal(1, attempts[1].Attempt);
+  // Priced as the model that served: 1000 at $10 a million, 200 at $50.
+  Assert.Equal(20000, attempts[1].CostMicros);
+  Assert.Equal(20000, result.CostMicros);
+}
+
+[Test(Bank)]
+[runas(Ines)]
+void the_walk_never_leaves_the_routers_list() {
+  // Only the large model is admitted for this call. It is down — and the small one, which is up, is never asked.
+  ScriptedAnswer.Stub((model, request) => {
+    new Heard { What = "asked", About = model };
+    if (model == "Large") { throw new ExternalServiceException("scripted-large is down"); }
+    return Scripted.Text("An answer nobody should get.");
+  });
+  var fault = Assert.Throws<ExternalServiceException>(() => Scrutinise("Is a ten-year-old bean still viable?"));
+  Assert.Equal("scripted-large is down", fault.Message);
+  var row = ModelCall.Single();
+  Assert.Equal("Large", row.Model);
+  Assert.Equal(ModelCallOutcome.Failed, row.Outcome);
+}
+
+[Test(Bank)]
+[runas(Ines)]
+void when_every_candidate_fails_the_call_fails_as_the_last_one_did_and_each_is_on_the_meter() {
+  ScriptedAnswer.Stub((model, request) => { throw new ExternalServiceException(model + " is down"); });
+  var fault = Assert.Throws<ExternalServiceException>(() => Summarise("beans"));
+  Assert.Equal("Large is down", fault.Message);
+  Assert.Equal(2, ModelCall.Count(c => c.Outcome == ModelCallOutcome.Failed));
+}
+
+[Test(Bank)]
+[runas(Ines)]
+void a_call_site_may_choose_among_the_models_the_policy_admits_and_never_add_one() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("from " + model));
+  // Admitted for a plain call: served by the one asked for.
+  Assert.Equal("from Large", SummariseWith("Large", "beans"));
+  // The sorter decides and does not chat; the policy does not send a plain call there.
+  var denied = Assert.Throws<LlmRouteDenied>(() => SummariseWith("Sorter", "beans"));
+  Assert.Contains("does not send this kind of call to 'Sorter'", denied.Message);
+  // A name nobody declared.
+  Assert.Throws<LlmRouteDenied>(() => SummariseWith("Enormous", "beans"));
+  // Nothing was sent for either refusal, so nothing is on the meter but the first call.
+  Assert.Equal(1, ModelCall.Count());
+}
+
+[Test(Bank)]
+[runas(Ines)]
+void a_router_that_names_a_model_the_app_does_not_declare_cannot_add_it() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("from " + model));
+  // The bank's router answers ["Ghost", "Small"] for this request; the app declares no Ghost.
+  Assert.Equal("from Small", SummariseWith("Ghost", "beans"));
+  var row = ModelCall.Single();
+  Assert.Equal("Small", row.Model);
+  Assert.Contains("the app declares no such model", row.Rejected!);
+}
+
+// ── the meter stands apart from the caller's work ───────────────────────────────────────────────────────────────────
+
+[Test(Bank)]
+[runas(Ines)]
+void a_call_is_on_the_meter_though_the_work_it_was_made_for_failed() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("Early beans.", 1000, 200));
+  var lot = SeedLot.Single(l => l.Code == "A1");
+  Assert.Throws<ValidationException>(() => CatalogueThenFail(lot));
+  UnitOfWork.Discard();
+  // The lot was never catalogued…
+  Assert.Equal("", SeedLot.Single(l => l.Code == "A1").Summary);
+  // …and the model was still paid: the call is on the meter.
+  var row = ModelCall.Single();
+  Assert.Equal(ModelCallOutcome.Served, row.Outcome);
+  Assert.Equal(2000, row.CostMicros);
+}
+
+[Test(Bank)]
+[runas(Ines)]
+void a_call_in_the_middle_of_other_work_commits_none_of_that_work() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("Early beans."));
+  var lot = SeedLot.Single(l => l.Code == "A1");
+  Catalogue(lot);
+  // The caller changes its mind: its own pending change goes, the meter row stays.
+  UnitOfWork.Discard();
+  Assert.Equal("", SeedLot.Single(l => l.Code == "A1").Summary);
+  Assert.Equal(1, ModelCall.Count());
+}
+
+[Test(Bank)]
+[runas(Ines)]
+void many_calls_started_at_once_are_each_served_and_each_metered() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("A line.", 100, 10));
+  SummariseAll(["beans", "peas", "oats", "rye", "flax", "kale"]);
+  Assert.Equal(6, ModelCall.Count(c => c.Outcome == ModelCallOutcome.Served));
+  Assert.Equal(6, ModelCall.ToList().Select(c => c.Call).Distinct().Count());
+}
+
+// ── the switch ──────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Bank)]
+[runas(Ines)]
+void with_ai_switched_off_a_call_is_refused_before_anything_is_sent() {
+  ScriptedAnswer.Stub((model, request) => { new Heard { What = "asked", About = model }; return Scripted.Text("Beans."); });
+  Assert.Equal("Beans.", Summarise("beans"));
+
+  GenerationIsOn.Stub(() => false);
+  var refused = Assert.Throws<LlmSwitchedOff>(() => Summarise("peas"));
+  Assert.Contains("switched off for this application by its operator", refused.Message);
+  Assert.Throws<LlmSwitchedOff>(() => FactsOfNote("peas"));
+  Assert.Throws<LlmSwitchedOff>(() => Judge("peas"));
+  Assert.Throws<LlmSwitchedOff>(() => Recite("peas"));
+  // The one call made before the switch is all the provider heard and all the meter holds.
+  Assert.Equal(1, Heard.Count(h => h.What == "asked"));
+  Assert.Equal(1, ModelCall.Count());
+
+  GenerationIsOn.Stub(() => true);
+  Assert.Equal("Beans.", Summarise("oats"));
+}
+
+// ── whose meter it is ───────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Bank)]
+void a_call_is_recorded_for_who_it_ran_for_and_read_only_by_who_the_app_says() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("Beans."));
+  runas (Omar) { Summarise("beans"); }
+  // Omar may call a model and may not read the meter.
+  runas (Omar) { Assert.Equal(0, ModelCall.Count()); }
+  runas (Ines) {
+    var row = ModelCall.Single();
+    Assert.Equal(Omar.Id, row.Requester);
+  }
+}
+
+[Test(Bank)]
+void who_may_call_a_model_at_all_is_the_apps_answer() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("Beans."));
+  runas (Rut) { Assert.Throws<NotAuthorized>(() => Summarise("beans")); }
+  runas (Ines) { Assert.Equal(0, ModelCall.Count()); }
+}
+
+[Test(Bank)]
+void a_meter_row_is_written_only_by_the_call_path_and_never_changed() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("Beans.", 1000, 200));
+  runas (Ines) { Summarise("beans"); }
+  // App code makes none — not a curator, not the treasurer.
+  runas (Ines) { Assert.Denied(() => ForgeMeterRow()); UnitOfWork.Discard(); }
+  runas (Tove) { Assert.Denied(() => ForgeMeterRow()); UnitOfWork.Discard(); }
+  // …and nobody deletes one but through the kit's own function, as whoever manages the spend.
+  runas (Ines) {
+    var row = ModelCall.Single();
+    Assert.Denied(() => { row.Delete(); UnitOfWork.Commit(); });
+    UnitOfWork.Discard();
+    Assert.Throws<NotAuthorized>(() => ForgetModelCallsBefore(DateTime.UtcNow.AddDays(1)));
+  }
+  runas (Tove) {
+    Assert.Equal(1, ModelCall.Count());
+    Assert.Equal(1, ForgetModelCallsBefore(DateTime.UtcNow.AddDays(1)));
+    UnitOfWork.Commit();
+    Assert.Equal(0, ModelCall.Count());
+  }
+}
+
+// ── the price book ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Bank)]
+void a_new_price_applies_from_its_moment_and_a_call_keeps_the_price_it_was_made_at() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("Beans.", 1000, 200));
+  runas (Ines) { Summarise("beans"); }                       // at the declared price: $1 and $5 a million
+
+  runas (Tove) { SetModelPrice("Small", 2, 10); UnitOfWork.Commit(); }
+  runas (Ines) { Summarise("peas"); }                        // at the price book's: $2 and $10
+
+  runas (Tove) { SetModelPrice("Small", 4, 20, from: DateTime.UtcNow.AddDays(7)); UnitOfWork.Commit(); }
+  runas (Ines) { Summarise("oats"); }                        // next week's price is not today's
+  TestClock.Advance(TimeSpan.FromDays(8));
+  runas (Ines) { Summarise("rye"); }                         // …and now it is
+
+  runas (Ines) {
+    var costs = ModelCall.OrderBy(c => c.At).ToList().Select(c => c.CostMicros).ToList();
+    Assert.Equal(4, costs.Count);
+    Assert.Equal(2000, costs[0]);
+    Assert.Equal(4000, costs[1]);
+    Assert.Equal(4000, costs[2]);
+    Assert.Equal(8000, costs[3]);
+    // The first call was priced from the declaration; the others point at the row that priced them.
+    var rows = ModelCall.OrderBy(c => c.At).ToList();
+    Assert.Null(rows[0].Price);
+    Assert.Equal(2m, rows[1].Price!.Input);
+    Assert.Equal(4m, rows[3].Price!.Input);
+  }
+}
+
+[Test(Bank)]
+void tokens_read_from_the_providers_cache_are_priced_as_such() {
+  ScriptedAnswer.Stub((model, request) => {
+    var answer = Scripted.Text("Yes.", 1000, 100);
+    answer.CacheReadTokens = 8000;
+    return answer;
+  });
+  runas (Ines) {
+    var result = Scrutinise("Is a ten-year-old bean still viable?");
+    // Large: 1000 fresh at $10, 8000 cached at $1, 100 out at $50 — 10000 + 8000 + 5000.
+    Assert.Equal(23000, result.CostMicros);
+    Assert.Equal(8000, ModelCall.Single().CacheReadTokens);
+  }
+}
+
+[Test(Bank)]
+void prices_are_set_only_by_who_manages_the_spend_and_only_through_the_kit() {
+  runas (Ines) { Assert.Throws<NotAuthorized>(() => SetModelPrice("Large", 0, 0)); }
+  runas (Tove) { Assert.Denied(() => ForgePrice()); UnitOfWork.Discard(); }
+  runas (Tove) { Assert.Equal(0, ModelPrice.Count()); }
+}
+
+// ── a streamed call ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Bank)]
+[runas(Ines)]
+void a_streamed_answer_is_passed_on_and_metered_from_its_closing_event() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("Beans keep five years.", 1000, 200));
+  Assert.Equal("Beans keep five years.", Recite("How long do beans keep?"));
+  var row = ModelCall.Single();
+  Assert.Equal(ModelCallKind.Stream, row.Kind);
+  Assert.Equal(ModelCallOutcome.Served, row.Outcome);
+  Assert.Equal(2000, row.CostMicros);
+}
+
+[Test(Bank)]
+[runas(Ines)]
+void the_closing_event_of_a_stream_says_who_served_it_and_what_it_cost() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("Beans.", 400, 100));
+  var closing = ClosingOf("Summarise: beans");
+  Assert.Equal(LlmStreamEventKind.MessageComplete, closing.Kind);
+  Assert.Equal("Small", closing.Model);
+  Assert.Equal("seed-bank:1", closing.RouteRule);
+  // 400 tokens at $1 a million and 100 at $5 — the meter's own figure, on the event.
+  Assert.Equal(900, closing.CostMicros);
+  Assert.Equal(900, ModelCall.Single().CostMicros);
+  Assert.Equal(ModelCall.Single().Call, closing.Call);
+}
+
+[Test(Bank)]
+[runas(Ines)]
+void a_stream_whose_provider_fails_before_it_begins_is_served_by_the_next_candidate() {
+  ScriptedAnswer.Stub((model, request) => {
+    if (model == "Small") { throw new ExternalServiceException("scripted-small answered 429"); }
+    return Scripted.Text("Five years.", 1000, 200);
+  });
+  Assert.Equal("Five years.", Recite("How long do beans keep?"));
+  var attempts = ModelCall.OrderBy(c => c.Attempt).ToList();
+  Assert.Equal(2, attempts.Count);
+  Assert.Equal(ModelCallOutcome.Failed, attempts[0].Outcome);
+  Assert.Equal("Large", attempts[1].Model);
+  Assert.Equal(ModelCallOutcome.Served, attempts[1].Outcome);
+}

@@ -1,0 +1,224 @@
+// A seed bank: growers send in lots of seed with a note, and the bank reads the note — a line for the catalogue,
+// the lot's facts as a record, and whether the lot is worth a germination test.
+namespace SeedBank;
+
+using Osysharp.Llm;
+
+/// The people of the bank. A curator reads what the models cost; the treasurer sets prices and budgets.
+[Principal] entity Keeper {
+  [Unique, MaxLength(80)] string Name;
+  bool Curator = false;
+  bool Treasurer = false;
+  /// Kept away from the models altogether.
+  bool Barred = false;
+  security { allow read when IsAuthenticated || IsAnonymous; }
+}
+
+policy UsesModels        => !Keeper.Any(k => k == user && k.Barred);
+policy ReadsModelUsage   => Keeper.Any(k => k == user && (k.Curator || k.Treasurer));
+policy ManagesModelSpend => Keeper.Any(k => k == user && k.Treasurer);
+
+/// A lot of seed as it arrived, with the grower's note.
+entity SeedLot {
+  [Required, Unique, MaxLength(40)] string Code;
+  [MaxLength(4000)] string Note = "";
+  [MaxLength(400)] string Summary = "";
+  security { allow read, create, update when IsAuthenticated; }
+}
+
+/// What a note says about its lot.
+public class LotFacts {
+  /// The plant, as the grower names it.
+  public string Species = "";
+  /// The year the seed was harvested.
+  public int HarvestYear;
+  /// Grams of seed in the lot.
+  public decimal Grams;
+  public bool Organic;
+}
+
+/// Whether a lot is worth a germination test.
+public enum Verdict { Test, Skip, AskGrower }
+
+/// Something the bank was told: a model it asked, a budget that ran short. Written by the scripts and the handlers, so
+/// a test can read what happened.
+entity Heard {
+  [Required, MaxLength(40)] string What;
+  [MaxLength(2000)] string About = "";
+  security { allow read, create when IsAuthenticated || IsAnonymous; }
+}
+
+[On] void BudgetRanShort(LlmBudgetSpent e) { new Heard { What = "spent", About = $"{e.Scope}:{e.Subject}" }; }
+[On] void BudgetRunsLow(LlmBudgetNearlySpent e) { new Heard { What = "nearly spent", About = $"{e.Scope}:{e.Subject} {e.SpentMicros}/{e.LimitMicros}" }; }
+
+/// The bank's routing: the cheap model first and the dear one behind it; reasoning the other way round; a call that
+/// needs quality goes to the dear one alone; a decision goes to the sorter, with the cheap chat model behind it. A
+/// model whose worst case does not fit the call's ceiling is dropped, with the reason.
+public class SeedBankRouter : ILlmRouter {
+  public LlmRoutingDecision Route(LlmTaskFacts facts) {
+    var decision = new LlmRoutingDecision { RuleId = "seed-bank:1" };
+    List<string> order = ["Small", "Large"];
+    if (facts.NeedsDecision) { order = ["Sorter", "Small"]; }
+    else if (facts.MinQuality > 1) { order = ["Large"]; }
+    else if (facts.Kind == LlmTaskKind.Reason) { order = ["Large", "Small"]; }
+    if (facts.Attempt > 0) { order = ["Large"]; decision.RuleId = "seed-bank:escalated"; }
+    if (facts.RequestedModel != null) {
+      // Two requests the bank's policy answers with a list of its own: a model with a cap, with the cheap one behind
+      // it — and a name no setup declares, to show that a router cannot add a model.
+      if (facts.RequestedModel == "Narrow") { order = ["Narrow", "Small"]; }
+      else if (facts.RequestedModel == "Ghost") { order = ["Ghost", "Small"]; }
+      else if (order.Contains(facts.RequestedModel!)) { order = [facts.RequestedModel!]; }
+      else {
+        decision.Denial = $"The seed bank does not send this kind of call to '{facts.RequestedModel}'.";
+        return decision;
+      }
+      decision.RuleId = "seed-bank:requested";
+    }
+    foreach (var name in order) {
+      var worst = WorstCase(name, facts);
+      if (facts.MaxCostMicros != null && worst > facts.MaxCostMicros!) {
+        decision.Rejected.Add(new LlmRejection { Model = name, Reason = "its worst case costs more than this call may spend" });
+      } else {
+        decision.Ordered.Add(name);
+      }
+    }
+    if (decision.Ordered.Count == 0) { decision.Denial = "No model fits what this call may spend."; }
+    return decision;
+  }
+
+  /// A million tokens in and out, in dollars — the same numbers the setup declares.
+  long WorstCase(string name, LlmTaskFacts facts) {
+    var input = name == "Large" ? 10m : name == "Sorter" ? 0.05m : 1m;
+    var output = name == "Large" ? 50m : name == "Sorter" ? 0m : 5m;
+    var outTokens = facts.MaxOutputTokens > 0 ? facts.MaxOutputTokens : 1000;
+    return (long)Math.Ceiling(facts.InputTokens * input + outTokens * output);
+  }
+}
+
+// ── what the bank does with a note ──────────────────────────────────────────────────────────────────────────────────
+
+/// A line for the catalogue.
+/// The same summary, as an ACTION — what a rule, an endpoint or an agent's tool runs.
+[Action("Summarise a note")]
+public string SummariseAsATool(string note) { return Summarise(note); }
+
+string Summarise(string note) { return await Llm.Complete("Summarise this grower's note in one line: " + note); }
+
+/// The same, from one named model.
+string SummariseWith(string model, string note) { return await Llm.Complete("Summarise: " + note, model); }
+
+/// The same, written onto the lot — a model call in the middle of the lot's own unit of work.
+void Catalogue(SeedLot lot) {
+  lot.Summary = Summarise(lot.Note);
+}
+
+/// The same, and then it turns out the lot cannot be catalogued.
+void CatalogueThenFail(SeedLot lot) {
+  lot.Summary = Summarise(lot.Note);
+  throw new ValidationException("This lot was withdrawn by its grower.");
+}
+
+LotFacts FactsOfNote(string note) { return await Llm.Extract<LotFacts>(note, "The lot's species, harvest year, weight and whether it is organic."); }
+/// The same facts, read off the label a grower photographed or the PDF they sent.
+LotFacts FactsOfLabel(string mediaType, byte[] bytes) { return await Llm.Extract<LotFacts>(Llm.FileBlock(mediaType, bytes), "The lot on the label."); }
+
+Decision<Verdict> Judge(string note) { return await Llm.Decide<Verdict>(note, "Is this lot worth a germination test?"); }
+
+/// One call, said in full: charged to a lot, for a purpose.
+LlmResult SummariseFor(string lotCode, string note) {
+  return await Llm.Complete(RequestOf("Summarise: " + note), new LlmCall { Scopes = ["lot:" + lotCode], Purpose = "catalogue line" });
+}
+
+/// A question that wants the stronger model first, and may step down to the cheaper one when money is short.
+LlmResult Reason(string question, bool mayStepDown) {
+  var call = new LlmCall { Kind = LlmTaskKind.Reason, Scopes = ["study:viability"] };
+  if (mayStepDown) { call.OnLimit = LlmOnLimit.StepDown; }
+  return await Llm.Complete(RequestOf(question), call);
+}
+
+/// A question only the stronger model may answer.
+LlmResult Scrutinise(string question) {
+  return await Llm.Complete(RequestOf(question), new LlmCall { MinQuality = 2 });
+}
+
+/// The words of a streamed answer, joined.
+string Recite(string prompt) {
+  var words = "";
+  await foreach (var e in Llm.Stream(prompt)) {
+    if (e.Kind == LlmStreamEventKind.TextDelta) { words = words + (e.Delta ?? ""); }
+  }
+  return words;
+}
+
+/// The last event of a streamed answer — the one that says who served it and what it cost.
+LlmStreamEvent ClosingOf(string prompt) {
+  var closing = new LlmStreamEvent();
+  await foreach (var e in Llm.Stream(prompt)) { closing = e; }
+  return closing;
+}
+
+/// Many notes summarised at once — each call a task of its own.
+void SummariseAll(List<string> notes) {
+  Parallel.ForEach(notes, note => { Summarise(note); });
+}
+
+/// The same, and a call the budget has no room for is simply not served.
+void SummariseAllThatFit(List<string> notes) {
+  Parallel.ForEach(notes, note => {
+    try { Summarise(note); } catch (LlmBudgetExceeded e) { }
+  });
+}
+
+/// Many calls at once to the model that takes two at a time.
+void SummariseAllNarrowly(List<string> notes) {
+  Parallel.ForEach(notes, note => { SummariseWith("Narrow", note); });
+}
+
+/// A line for one lot, held to a limit the bank puts on that lot's calls: at most `limitMicros` in all.
+string SummariseWithin(string lotCode, long limitMicros, string note) {
+  return (await Llm.Complete(RequestOf("Summarise: " + note), new LlmCall {
+    Limits = [ new LlmLimit { Scope = "lot:" + lotCode, LimitMicros = limitMicros } ],
+  })).Text();
+}
+
+/// Many lines for one lot at once, each held to the same limit; a call the limit has no room for is not served.
+void SummariseAllWithin(string lotCode, long limitMicros, List<string> notes) {
+  Parallel.ForEach(notes, note => {
+    try { SummariseWithin(lotCode, limitMicros, note); } catch (LlmBudgetExceeded e) { }
+  });
+}
+
+/// What a lot's limit has counted, turned back by the app.
+void ForgetWhatALotSpent() {
+  foreach (var a in LlmAllowance.ToList()) { a.SpentMicros = 0; }
+}
+
+/// A count against a limit made up by the app.
+void ForgeAllowance() {
+  new LlmAllowance { Scope = "lot:A1", Period = new DateOnly(2000, 1, 1), SpentMicros = 0 };
+}
+
+// ── what app code is not able to do ─────────────────────────────────────────────────────────────────────────────────
+
+/// A meter row made up by the app.
+void ForgeMeterRow() {
+  new ModelCall { Call = Guid.NewGuid(), Model = "Small", CostMicros = 0 };
+}
+
+/// A budget's count turned back by the app.
+void ForgetWhatWasSpent() {
+  foreach (var spend in LlmSpend.ToList()) { spend.SpentMicros = 0; }
+}
+
+/// A budget made by the app without `SetBudget`.
+void ForgeBudget() {
+  new LlmBudget { Scope = "app", Window = LlmBudgetWindow.Day, LimitMicros = 1000000000 };
+}
+
+/// A price made by the app without `SetModelPrice`.
+void ForgePrice() {
+  new ModelPrice { Model = "Large", Input = 0, Output = 0 };
+}
+
+/// A meter row given to nobody by hand.
+void RewriteWhoAsked(ModelCall row) { row.Requester = null; }

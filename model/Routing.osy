@@ -1,0 +1,132 @@
+// Routing — what a ROUTER implements to decide which model serves which call, the facts it decides from, and the
+// decision it answers with.
+namespace Osysharp.Llm;
+
+/// The kind of work a model is being asked to do — what quality floors and tiers are declared per.
+public enum LlmTaskKind { Extract, Summarize, Transform, Code, Reason, Converse, Classify, Generate, Decide }
+
+/// Whether a person is waiting. `Batch` is a first-class routing target — a provider's batch endpoint is
+/// substantially cheaper — not an afterthought.
+public enum LlmLatencySensitivity { Interactive, Background, Batch }
+
+/// Which step of a larger job a call is — so a policy can choose per step ("plan with the best, fill with the
+/// cheapest") and a record can explain per step. A call that is not part of one is `Call`.
+public enum LlmStep {
+  /// A plain call: not a step of anything.
+  Call,
+  /// Planning the work.
+  Plan,
+  /// Doing a turn of it.
+  Act,
+  /// A helper's turn, on a share of the parent's allowance.
+  Delegate,
+  /// Filling in one tool's arguments, or repairing an answer that did not fit its shape.
+  Fill,
+  /// Shortening: a digest, a hand-over, a compaction.
+  Summarize,
+  /// Judging another answer.
+  Judge,
+  /// A guard's check on what goes in or comes out.
+  Guard,
+  /// Proposing what to do differently next time.
+  Reflect,
+  /// Asking a more capable model for advice on one focused question, by the model doing the work.
+  Consult,
+}
+
+/// ⭐ WHAT THE ROUTER KNOWS ABOUT ONE CALL, and the only input a decision may see.
+///
+/// Deliberately FACTS, never a verdict: nothing here names a tier or a model. That separation is what lets a policy be
+/// replayed — the same facts, against a pinned policy, must reach the same decision forever — and what stops a
+/// classifier quietly acquiring the authority to spend money. The facts of every call are kept on its meter row.
+public class LlmTaskFacts {
+  /// What kind of work this is.
+  public LlmTaskKind Kind = LlmTaskKind.Generate;
+
+  /// Which step of a larger job it is.
+  public LlmStep Step = LlmStep.Call;
+
+  /// How much prompt is going in, estimated from its length.
+  public int InputTokens = 0;
+
+  /// Whether the answer is being watched by a person right now. A streamed answer is Interactive by construction:
+  /// somebody is reading it as it arrives.
+  public LlmLatencySensitivity LatencySensitivity = LlmLatencySensitivity.Interactive;
+
+  /// Capability needs. Each is a hard FILTER, never a preference — a model without vision cannot serve a vision task
+  /// at any price, however cheap it is.
+  public bool NeedsTools = false;
+  public bool NeedsVision = false;
+  public bool NeedsStructuredOutput = false;
+  /// The call wants a typed decision (`Llm.Decide<T>`). A model built for it is preferred; one that chats may serve.
+  public bool NeedsDecision = false;
+
+  /// The lowest quality rank that may serve this call, on the scale the app's router ranks its models by. 0: no floor
+  /// beyond the policy's own.
+  public int MinQuality = 0;
+
+  /// 0 for the first try. 1 and up when the caller is asking AGAIN because the last answer was not good enough —
+  /// `EscalatedFrom` names the model that gave it.
+  public int Attempt = 0;
+  public string? EscalatedFrom;
+
+  /// The most this call may cost, in micro-dollars: what is left of the tightest budget it falls under, when that
+  /// budget says to step down to a cheaper model rather than stop. Null: no ceiling.
+  public long? MaxCostMicros;
+  /// How many tokens the answer may run to — what a router multiplies a model's output price by to compare it with
+  /// `MaxCostMicros`.
+  public int MaxOutputTokens = 0;
+
+  /// The call site's model REQUEST, if it made one — the app's name for the model.
+  /// ⛔ IT MAY ONLY NARROW. It is matched against what the router already admits, and naming something inadmissible is
+  /// a DENIAL rather than an override — a request that could widen the envelope would make every policy advisory.
+  public string? RequestedModel;
+}
+
+/// Why one candidate did not survive. The point of recording it: *"why did this go to the expensive model in March"*
+/// is answerable from stored reasons, rather than by re-deriving intent from a log line.
+public class LlmRejection {
+  public string Model = "";
+  public string Reason = "";
+}
+
+/// ⭐ THE DECISION: an ORDERED candidate list, what was rejected and why, or a denial.
+///
+/// The order is also the FALLBACK order: when the first candidate's provider fails, the call moves to the second, and
+/// never to a model that is not on the list.
+///
+/// ⛔ AN EMPTY CANDIDATE LIST IS A DENIAL WITH A REASON, NEVER A SILENT DOWNGRADE. A task no admissible model can
+/// serve must fail loudly, because the alternative — quietly serving it with something the policy excluded — is the
+/// failure the policy existed to prevent.
+public class LlmRoutingDecision {
+  /// Candidates, best first, by the app's names for them. Empty when `Denial` is set, and never both.
+  public List<string> Ordered = [];
+
+  /// Candidates considered and dropped, each with the reason it was dropped.
+  public List<LlmRejection> Rejected = [];
+
+  /// Set when nothing was admissible, saying why in a sentence a developer can act on. Null otherwise.
+  public string? Denial;
+
+  /// What decided this — the router's own rule id. Recorded so a decision can be attributed to the thing that made it.
+  public string RuleId = "";
+}
+
+/// ⭐ WHAT A MODEL ROUTER IMPLEMENTS — the ONE place that decides which model serves which call. An app names one:
+/// `app.Llm = new LlmSetup { Router = new CostTieredRouter { … }, … };`
+///
+/// ⛔ `Route` MUST BE PURE: no outbound call, no data read, no data write, no clock. Two guarantees rest on that:
+///      · SHADOW ROUTING — replay stored facts against a candidate policy and compare the decisions — is only possible
+///        if the decision is a function of the facts.
+///      · REPRODUCTION — the same facts, the same policy version, forever the same decision — is what makes
+///        *"why did this call cost that"* answerable a quarter later.
+///    A router that needs to know something must be CONFIGURED with it (a field on the class, set where it is named),
+///    not go and look it up while deciding.
+///
+/// ⚠ TWO RULES ARE NOT NEGOTIABLE:
+///   · THE NARROWING RULE — a call site may choose among the models the app admits; it may never add one.
+///   · DENY-BY-DEFAULT — no admissible candidate means a denial carrying a reason, never a quiet substitution.
+public interface ILlmRouter {
+  /// Decide which model serves this call. Pure: a function of `facts` and whatever this router was configured with.
+  LlmRoutingDecision Route(LlmTaskFacts facts);
+}

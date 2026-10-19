@@ -1,0 +1,497 @@
+// The call path — the one road every model call takes: the AI switch, the router, a reservation against every budget
+// the call falls under, the provider, the next candidate when one fails, and a meter row for each attempt.
+namespace Osysharp.Llm;
+
+/// What a caller says ABOUT a call, beside the request itself: what kind of work it is, what it is charged to, and
+/// what to do when the money runs short. Every field has a default; `Llm.Complete(prompt)` says none of it.
+public class LlmCall {
+  /// The model to serve with, by the app's name for it. It can only NARROW what the router admits: naming a model the
+  /// policy does not allow for this call is a refusal, never an override. Null: the router's first choice.
+  public string? Model;
+  /// What kind of work this is, and which step of a larger job — what the router's floors and tiers are declared per.
+  public LlmTaskKind Kind = LlmTaskKind.Generate;
+  public LlmStep Step = LlmStep.Call;
+  /// Whether a person is waiting on the answer.
+  public LlmLatencySensitivity Latency = LlmLatencySensitivity.Interactive;
+  /// The lowest quality rank that may serve it, on the scale the app's router ranks its models by.
+  public int MinQuality = 0;
+  /// 1 and up when this call asks AGAIN because the last answer was not good enough; `EscalatedFrom` is the model that
+  /// gave it. A router with a cascade moves up a tier.
+  public int Attempt = 0;
+  public string? EscalatedFrom;
+
+  /// What the call is charged to, beside the app and the person it runs for: `task:8f1c…`, `agent:Screener`,
+  /// `case:8f1c…`. A budget set on a scope counts every call that names it.
+  public List<string> Scopes = [];
+  /// What it is for, in a few words — "triage", "weekly digest". Kept on the meter row. Never put the prompt here.
+  public string Purpose = "";
+  /// ⭐ A CALL MADE IN A WORKFLOW'S RUN IS CHARGED TO IT, with nothing said: to the workflow (`workflow:Onboarding`)
+  /// and to that run of it (`run.Onboarding:8f1c…`) — see `RunScopes`. So what a process costs is counted as it
+  /// happens, and a budget on either holds every call made for it. False: the call names what it is charged to
+  /// itself — for code that goes on, in a run of its own, with work that was started for another.
+  public bool ChargedToItsRun = true;
+
+  /// ⭐ LIMITS THIS CODE PUTS ON ITS OWN CALLS — "the calls for this piece of work, a dollar in all". Each names a scope
+  /// (charged and recorded like any in `Scopes`) and the most the calls that carry the limit may spend on it. Room is
+  /// reserved against it before the call leaves, exactly as against a budget. It binds only the calls that carry it:
+  /// code can hold its own work to a limit, never anybody else's. Budgets (`SetBudget`) still apply on top.
+  public List<LlmLimit> Limits = [];
+
+  /// What to do when a budget has no room: null leaves it to the budget (`LlmBudget.OnLimit`) or the limit.
+  public LlmOnLimit? OnLimit;
+  /// The most this one call may cost, in millionths of a dollar. Null: only the budgets bound it.
+  public long? MaxCostMicros;
+}
+
+/// A limit the calling code puts on the calls it makes for one scope — see `LlmCall.Limits`.
+///
+///     new LlmLimit { Scope = "task:" + task.Id, LimitMicros = 500000 }        // half a dollar for this piece of work
+public class LlmLimit {
+  /// What is limited: a kind and a subject, `task:8f1c…`, `agent:Screener`. The calls are charged to it too.
+  public string Scope = "";
+  /// The period the limit is for. `Total` never starts over — the usual one for a piece of work.
+  public LlmBudgetWindow Window = LlmBudgetWindow.Total;
+  /// The most the calls carrying this limit may spend on the scope in one period, in millionths of a US dollar.
+  public long LimitMicros = 0;
+  /// What a call does when the limit has no room: stop, or step down to a cheaper model.
+  public LlmOnLimit OnLimit = LlmOnLimit.Stop;
+}
+
+/// What a call answered, and what it took to get the answer.
+public class LlmResult {
+  public LlmResponse Response = new LlmResponse();
+  /// The model that served it, by the app's name.
+  public string Model = "";
+  /// What it cost, in millionths of a US dollar — this call's serving attempt. Failed attempts cost nothing.
+  public long CostMicros = 0;
+  /// The call's id: what its meter rows share (`ModelCall.Call`).
+  public Guid Call;
+  /// How many models were tried before one answered: 1 when the first did.
+  public int Attempts = 1;
+  /// The router's rule that ordered the candidates.
+  public string RouteRule = "";
+
+  /// The answer's text — its text blocks, joined.
+  public string Text() { return TextOf(Response); }
+}
+
+// ── refusals ────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// A call that was refused BEFORE anything was sent to a provider. Catch it to tell "we chose not to" from "they
+/// failed" — a provider's failure is an `ExternalServiceException`.
+///
+/// A `ConflictException` — it cannot be done as things stand: the switch is off, no model is admitted, the money is
+/// spent, every model is busy. So whoever ran the code that made the call — a page, an endpoint, a model whose tool
+/// it was — is told why, in these words, instead of "it failed for a reason the app did not foresee".
+public class LlmRefused : ConflictException { }
+
+/// The operator has switched generative AI off for this app.
+public class LlmSwitchedOff : LlmRefused { }
+
+/// The app's routing admits no model for this call — or the call asked for one it does not admit.
+public class LlmRouteDenied : LlmRefused { }
+
+/// A budget the call falls under has no room for it.
+public class LlmBudgetExceeded : LlmRefused {
+  /// Which budget: its scope ("app", "requester", "task"…), the subject within it, and its window.
+  public string Scope = "";
+  public string Subject = "";
+  public LlmBudgetWindow Window = LlmBudgetWindow.Day;
+  /// What is left of it, in millionths of a dollar.
+  public long LeftMicros = 0;
+}
+
+/// Every candidate was already serving as many calls as it allows.
+public class LlmBusy : LlmRefused { }
+
+/// The model answered, and the answer was not a document of the shape asked for — after one repair.
+/// Deliberately NOT a refusal an outside caller is told: it is a fault, and its message quotes the model's own
+/// words — which belong in the app's log, not in an answer to whoever called.
+public class LlmAnswerUnreadable : Exception { }
+
+// ── the switch ──────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Whether the operator allows this app generative AI right now. A function of its own so a test can answer it:
+/// `GenerationIsOn.Stub(() => false);`.
+public bool GenerationIsOn() { return Ai.GenerationEnabled; }
+
+void RequireGeneration() {
+  if (!GenerationIsOn()) {
+    throw new LlmSwitchedOff("Generative AI is switched off for this application by its operator. Nothing was sent.");
+  }
+}
+
+// ── who, and what it is charged to ──────────────────────────────────────────────────────────────────────────────────
+
+/// Who a call runs for: the signed-in person, or the actor the code is running as. Null for a visitor and the system.
+Guid? CurrentRequester() { return Security.CurrentUserId; }
+
+/// The scopes a call is charged to: the app, the person it runs for, the model that serves it, and whatever its caller
+/// named — each a `kind:subject`, one per line.
+List<string> ScopesOf(LlmCall call, string model) {
+  List<string> scopes = ["app:"];
+  var who = CurrentRequester();
+  if (who != null) { scopes.Add("requester:" + who!.ToString()); }
+  scopes.Add("model:" + model);
+  foreach (var s in call.Scopes) {
+    var scope = ScopeLine(s);
+    if (scope != "" && !scopes.Contains(scope)) { scopes.Add(scope); }
+  }
+  // A scope the call limits is one it is charged to.
+  foreach (var limit in call.Limits) {
+    var scope = ScopeLine(limit.Scope);
+    if (scope != "" && !scopes.Contains(scope)) { scopes.Add(scope); }
+  }
+  // Made in a workflow's run, it is charged to the workflow and to that run.
+  if (call.ChargedToItsRun) {
+    foreach (var scope in RunScopes()) { if (!scopes.Contains(scope)) { scopes.Add(scope); } }
+  }
+  return scopes;
+}
+
+/// ⭐ WHAT A MODEL CALL IS CHARGED TO BECAUSE OF WHERE IT IS MADE: in a workflow's run, the workflow —
+/// `workflow:Onboarding` — and that run of it — `run.Onboarding:8f1c…`. Empty anywhere else.
+///
+/// Every call made in a run carries both, so a budget can be set on either, and what one run cost is read back:
+///
+///     SetBudget("workflow", "Onboarding", LlmBudgetWindow.Month, 200);            // every run of it together, a month
+///     SetBudget(RunKind("Onboarding"), "", LlmBudgetWindow.Total, 2);             // each run of it, two dollars in all
+///     var cost = SpentOn(RunScope("Onboarding", run));                            // what one run has cost
+public List<string> RunScopes() {
+  var run = Workflow.Current;
+  if (run == null) { return []; }
+  return [WorkflowScope(run.Workflow), RunScope(run.Workflow, run.Id)];
+}
+
+/// The scope every call made for a workflow is charged to, whichever run: `workflow:Onboarding`.
+public string WorkflowScope(string workflow) { return "workflow:" + workflow; }
+
+/// The scope the calls of ONE run of a workflow are charged to: `run.Onboarding:8f1c…`.
+public string RunScope(string workflow, Guid run) { return RunKind(workflow) + ":" + run.ToString(); }
+
+/// The kind a budget for EACH run of a workflow is set on: `run.Onboarding` — an empty subject gives every run an
+/// allowance of its own; a run's id as the subject sets one run's.
+public string RunKind(string workflow) { return "run." + workflow; }
+
+/// A scope as it is recorded: `kind:subject`, trimmed; a bare kind gets its colon. "" for nothing.
+public string ScopeLine(string scope) {
+  var line = scope.Trim();
+  if (line == "") { return ""; }
+  return line.IndexOf(":") < 0 ? line + ":" : line;
+}
+
+// ── routing ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// The facts the router decides from, for one request.
+LlmTaskFacts FactsOf(LlmRequest request, LlmCall call, int maxOutputTokens) {
+  var needsVision = false;
+  foreach (var m in request.Messages) {
+    foreach (var b in m.Content) { if (b.Kind == LlmBlockKind.Image || b.Kind == LlmBlockKind.Document) { needsVision = true; } }
+  }
+  return new LlmTaskFacts {
+    Kind = call.Kind, Step = call.Step, InputTokens = EstimateTokens(request), LatencySensitivity = call.Latency,
+    NeedsTools = request.Tools.Count > 0, NeedsVision = needsVision, NeedsStructuredOutput = request.OutputSchemaJson != null,
+    MinQuality = call.MinQuality, Attempt = call.Attempt, EscalatedFrom = call.EscalatedFrom,
+    MaxCostMicros = call.MaxCostMicros, MaxOutputTokens = maxOutputTokens, RequestedModel = call.Model,
+  };
+}
+
+/// Roughly how many tokens a request's prompt is — four characters to a token, which is close enough to decide a
+/// reservation and a context-window filter. What a call COST is never estimated: it is the provider's own count.
+public int EstimateTokens(LlmRequest request) {
+  var chars = 0;
+  if (request.SystemSegments.Count > 0) {
+    foreach (var s in request.SystemSegments) { chars = chars + s.Content.Length; }
+  } else if (request.SystemPrompt != null) {
+    chars = chars + request.SystemPrompt!.Length;
+  }
+  foreach (var m in request.Messages) {
+    foreach (var b in m.Content) {
+      chars = chars + (b.Text ?? "").Length + (b.InputJson ?? "").Length + (b.ResultJson ?? "").Length;
+      // An image is priced by its size, not its bytes; a flat allowance keeps the estimate from reading as zero.
+      if (b.Kind == LlmBlockKind.Image) { chars = chars + 6000; }
+    }
+  }
+  foreach (var t in request.Tools) { chars = chars + t.Name.Length + t.Description.Length + t.InputSchemaJson.Length; }
+  if (request.OutputSchemaJson != null) { chars = chars + request.OutputSchemaJson!.Length; }
+  return (chars + 3) / 4;
+}
+
+/// The candidates for one call, in order: the app's router's answer — or, with no router, the model the call asked
+/// for or the app's default — with every name checked against the models the app declares. A router can order and
+/// drop; it cannot add.
+LlmRoutingDecision RouteFor(LlmTaskFacts facts) {
+  var setup = App.Setting<LlmSetup>();
+  if (setup.Models.Count == 0) {
+    return new LlmRoutingDecision {
+      RuleId = "llm:no-models",
+      Denial = "This app declares no models. Name them where the app is configured: "
+             + "`app.Llm = new LlmSetup { Models = [ new LlmModel { Name = \"Fast\", Client = …, Model = \"…\" } ] };`",
+    };
+  }
+  if (setup.Router == null) {
+    var wanted = facts.RequestedModel ?? (setup.Default == "" ? setup.Models[0].NameOf() : setup.Default);
+    var only = new LlmRoutingDecision { RuleId = facts.RequestedModel == null ? "llm:default" : "llm:requested" };
+    if (Declares(wanted)) { only.Ordered.Add(wanted); }
+    else {
+      only.Denial = facts.RequestedModel == null
+        ? $"The app's default model '{wanted}' is not one of the models it declares (`LlmSetup.Default`)."
+        : $"This call asked for model '{wanted}', which is not one of the models this app declares. A call may choose "
+          + "among the models the app has; it cannot add one.";
+    }
+    return only;
+  }
+  var decided = setup.Router!.Route(facts);
+  var checked = new LlmRoutingDecision { RuleId = decided.RuleId, Denial = decided.Denial, Rejected = decided.Rejected };
+  foreach (var name in decided.Ordered) {
+    if (!Declares(name)) {
+      checked.Rejected.Add(new LlmRejection { Model = name, Reason = "the router named it and the app declares no such model" });
+    } else if (!checked.Ordered.Contains(name)) {
+      checked.Ordered.Add(name);
+    }
+  }
+  if (checked.Ordered.Count == 0 && checked.Denial == null) {
+    checked.Denial = "The app's router admitted no model this app declares for this call.";
+  }
+  return checked;
+}
+
+bool Declares(string name) {
+  foreach (var m in App.Setting<LlmSetup>().Models) { if (m.NameOf() == name) { return true; } }
+  return false;
+}
+
+// ── price ───────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// What a million tokens cost on one model at this moment, and the price-book row that says so.
+public class LlmPricePoint {
+  public decimal Input = 0;
+  public decimal Output = 0;
+  public decimal CacheRead = 0;
+  public decimal CacheWrite = 0;
+  /// The `ModelPrice` row, or null when the price is the one on the model's own declaration.
+  public Guid? Row;
+}
+
+/// The price in force for `model` now: the latest row of the price book that has started, else the price the app
+/// declared with the model.
+public LlmPricePoint PriceOf(string model) {
+  var now = DateTime.UtcNow;
+  var row = ModelPrice.Where(p => p.Model == model && p.From <= now).OrderByDescending(p => p.From).FirstOrDefault();
+  if (row != null) {
+    return new LlmPricePoint { Input = row.Input, Output = row.Output, CacheRead = row.CacheRead, CacheWrite = row.CacheWrite, Row = row.Id };
+  }
+  foreach (var m in App.Setting<LlmSetup>().Models) {
+    if (m.NameOf() == model) { return m.DeclaredPrice(); }
+  }
+  return new LlmPricePoint();
+}
+
+/// What some tokens cost at a price, in millionths of a dollar, rounded UP — a price per million tokens in dollars is
+/// a price per token in millionths.
+public long CostMicros(LlmPricePoint price, int inputTokens, int outputTokens, int cacheReadTokens, int cacheWriteTokens) {
+  var cost = inputTokens * price.Input + outputTokens * price.Output
+           + cacheReadTokens * price.CacheRead + cacheWriteTokens * price.CacheWrite;
+  return (long)Math.Ceiling(cost);
+}
+
+// ── the walk ────────────────────────────────────────────────────────────────────────────────────────────────────────
+// Every kind of call — a plain one, a streamed one, a decision — walks the router's candidates the same way: admit one
+// (a ceiling, the budgets, the model's own cap), call its provider, and record what became of the attempt.
+
+/// What a walk remembers from one candidate to the next.
+class LlmWalk {
+  public Guid Call;
+  /// The next attempt's number: every candidate that was recorded counts, served or not.
+  public int Attempt = 0;
+  public List<string> Tried = [];
+  /// The model whose provider failed last, and what it — or a busy model — said.
+  public string? FailedBefore;
+  public string Problem = "";
+  /// A budget has already said to step down once; a second refusal stops.
+  public bool SteppedDown = false;
+}
+
+/// Whether one candidate may be called, and the record its attempt is written from.
+class LlmAdmission {
+  public bool Proceed = false;
+  /// Room was held for it and must be settled, whatever becomes of the attempt.
+  public bool Held = false;
+  public ModelCallOpening Opening = new ModelCallOpening();
+  public LlmPricePoint Price = new LlmPricePoint();
+  /// The budget that refused, when one did.
+  public LlmHoldResult Refused = new LlmHoldResult();
+}
+
+/// The router's answer for these facts, or the refusal when it admits nothing.
+LlmRoutingDecision RouteOrRefuse(LlmTaskFacts facts) {
+  var route = RouteFor(facts);
+  if (route.Denial != null) { throw new LlmRouteDenied(route.Denial!); }
+  return route;
+}
+
+/// ⭐ ADMIT ONE CANDIDATE: check it against what the call may spend, then reserve room for it against every budget
+/// it falls under and take a place among the model's concurrent calls. A candidate that is not admitted is recorded
+/// on the meter with the reason, and nothing is sent to it.
+LlmAdmission Admit(LlmWalk walk, ModelCallKind kind, string name, LlmModel model, LlmTaskFacts facts,
+                   LlmRoutingDecision route, LlmCall call, int outTokens) {
+  var price = PriceOf(name);
+  var estimate = CostMicros(price, facts.InputTokens, outTokens, 0, 0);
+  var scopes = ScopesOf(call, name);
+  var admission = new LlmAdmission { Price = price };
+  admission.Opening = new ModelCallOpening {
+    Call = walk.Call, Attempt = walk.Attempt, Kind = kind, Model = name, ProviderModel = model.ProviderModel(),
+    FallbackFrom = walk.FailedBefore, RouteRule = route.RuleId, FactsJson = JsonSerializer.Serialize(facts),
+    RejectedJson = JsonSerializer.Serialize(route.Rejected), Requester = CurrentRequester(),
+    Scopes = string.Join("\n", scopes), Purpose = call.Purpose, PriceRow = price.Row, ReservedMicros = estimate,
+  };
+
+  if (facts.MaxCostMicros != null && estimate > facts.MaxCostMicros!) {
+    RecordModelCall(admission.Opening, ModelCallOutcome.OverBudget, 0, 0, 0, 0, 0, 0,
+      $"It could cost ${Dollars(estimate)}, and this call may spend ${Dollars(facts.MaxCostMicros!)}.");
+    walk.Attempt = walk.Attempt + 1;
+    return admission;
+  }
+
+  var hold = HoldModelSpend(walk.Call, name, model.MaxConcurrent, estimate, scopes, call.OnLimit, call.Limits);
+  if (hold.Refusal == LlmHoldRefusal.None) {
+    admission.Proceed = true;
+    admission.Held = hold.Held;
+    return admission;
+  }
+  RecordModelCall(admission.Opening, hold.Refusal == LlmHoldRefusal.Busy ? ModelCallOutcome.Busy : ModelCallOutcome.OverBudget,
+    0, 0, 0, 0, 0, 0, hold.Why);
+  walk.Attempt = walk.Attempt + 1;
+  walk.Problem = hold.Why;
+  if (hold.Refusal == LlmHoldRefusal.OverBudget) {
+    // A budget counts its refusals and tells whoever listens; a limit the caller declared tells the caller, who is
+    // about to catch it.
+    if (hold.Budget != null) { NoteBudgetRefusal(hold.Budget!, hold.Subject, hold.Period); }
+    admission.Refused = hold;
+  }
+  return admission;
+}
+
+/// A budget refused a candidate. When it (or the call) says to step down and has not already: the facts get what is
+/// left as their ceiling and the router is asked again — the answer is the new list to walk. Otherwise, and when the
+/// router admits nothing under the ceiling, the call stops here.
+LlmRoutingDecision StepDownOrStop(LlmWalk walk, LlmHoldResult refused, LlmTaskFacts facts) {
+  if (refused.StepDown && !walk.SteppedDown) {
+    walk.SteppedDown = true;
+    facts.MaxCostMicros = refused.LeftMicros;
+    var cheaper = RouteFor(facts);
+    if (cheaper.Denial == null) { return cheaper; }
+  }
+  throw new LlmBudgetExceeded(refused.Why) {
+    Scope = refused.Scope, Subject = refused.Subject, Window = refused.Window, LeftMicros = refused.LeftMicros,
+  };
+}
+
+/// The provider answered: settle what was held at what it actually cost, and write the attempt's meter row.
+/// Answers the cost.
+long Served(LlmAdmission admission, int inputTokens, int outputTokens, int cacheReadTokens, int cacheWriteTokens,
+            DateTime started, string? note) {
+  var cost = CostMicros(admission.Price, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens);
+  if (admission.Held) { SettleModelSpend(admission.Opening.Call, cost); }
+  // The host's own count of AI work across everything it serves — a measurement, bounded by nothing.
+  Ai.CountGeneration(inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens);
+  RecordModelCall(admission.Opening, ModelCallOutcome.Served, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens,
+    cost, MillisSince(started), note);
+  return cost;
+}
+
+/// The provider failed: release what was held, write the attempt's meter row, and remember it for the next candidate.
+void Failed(LlmWalk walk, LlmAdmission admission, DateTime started, string said) {
+  if (admission.Held) { SettleModelSpend(admission.Opening.Call, 0); }
+  RecordModelCall(admission.Opening, ModelCallOutcome.Failed, 0, 0, 0, 0, 0, MillisSince(started), said);
+  walk.FailedBefore = admission.Opening.Model;
+  walk.Problem = said;
+  walk.Attempt = walk.Attempt + 1;
+}
+
+/// No candidate served: fail as the last provider failed, or refuse.
+void NoneServed(LlmWalk walk) {
+  if (walk.FailedBefore != null) { throw new ExternalServiceException(walk.Problem); }
+  if (walk.Problem != "") { throw new LlmBusy(walk.Problem); }
+  throw new LlmRouteDenied("No model this app's routing admits for this call can serve it.");
+}
+
+// ── the call ────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// ⭐ ONE CALL TO A MODEL, all of it: refused when the operator has switched AI off; routed by the app's router;
+/// room reserved against every budget it falls under before anything is sent; served by the first candidate whose
+/// provider answers; and one meter row written for every attempt, whatever became of it.
+///
+/// `Llm.Complete(request, call)` is this function. It is top-level so a test can answer for it whole:
+/// `CompleteWith.Stub((request, call) => new LlmResult { … });`.
+public LlmResult CompleteWith(LlmRequest request, LlmCall call) {
+  RequireGeneration();
+  var walk = new LlmWalk { Call = Guid.NewGuid() };
+  var maxOut = request.MaxTokens ?? 0;
+  var facts = FactsOf(request, call, maxOut);
+  var route = RouteOrRefuse(facts);
+  var index = 0;
+  while (index < route.Ordered.Count) {
+    var name = route.Ordered[index];
+    index = index + 1;
+    if (walk.Tried.Contains(name)) { continue; }
+    walk.Tried.Add(name);
+    var model = ModelNamed(name);
+    if (!model.Chats()) { continue; }
+
+    var admission = Admit(walk, ModelCallKind.Complete, name, model, facts, route, call, maxOut > 0 ? maxOut : model.MaxOutputTokens);
+    if (admission.Refused.Refusal == LlmHoldRefusal.OverBudget) {
+      route = StepDownOrStop(walk, admission.Refused, facts);
+      index = 0;
+      continue;
+    }
+    if (!admission.Proceed) { continue; }
+
+    var started = DateTime.UtcNow;
+    LlmResponse? response = null;
+    try {
+      request.Model = model.ProviderModel();
+      response = EveryModelIsScripted() ? ScriptedAnswer(name, request) : model.Client!.Complete(request);
+    } catch (ExternalServiceException e) {
+      // The provider failed or refused (an outage, a rate limit, an overload): on to the router's next candidate —
+      // never to a model that is not on its list.
+      Failed(walk, admission, started, e.Message);
+    } catch (Exception e) {
+      // Not the provider's answer but a fault in reaching it: recorded and released like a failure, and raised as it is.
+      Failed(walk, admission, started, e.Message);
+      throw;
+    }
+    if (response != null) {
+      var cost = Served(admission, response!.InputTokens, response!.OutputTokens, response!.CacheReadTokens,
+                        response!.CacheCreationTokens, started, null);
+      return new LlmResult { Response = response!, Model = name, CostMicros = cost, Call = walk.Call,
+                             Attempts = walk.Attempt + 1, RouteRule = route.RuleId };
+    }
+  }
+  NoneServed(walk);
+  throw new LlmRouteDenied("No model served this call.");
+}
+
+LlmModel ModelNamed(string name) {
+  foreach (var m in App.Setting<LlmSetup>().Models) { if (m.NameOf() == name) { return m; } }
+  throw new LlmRouteDenied($"This app declares no model named '{name}'.");
+}
+
+int MillisSince(DateTime started) {
+  return (int)(DateTime.UtcNow - started).TotalMilliseconds;
+}
+
+/// The text of an answer: its text blocks, joined.
+public string TextOf(LlmResponse response) {
+  var text = "";
+  foreach (var b in response.Content) { if (b.Kind == LlmBlockKind.Text) { text = text + (b.Text ?? ""); } }
+  return text;
+}
+
+/// A request that is one question from the user, with an optional system prompt.
+public LlmRequest RequestOf(string prompt, string system = "") {
+  var request = new LlmRequest();
+  if (system != "") { request.SystemPrompt = system; }
+  request.Messages.Add(new LlmMessage { Role = "user", Content = [ new LlmContentBlock { Kind = LlmBlockKind.Text, Text = prompt } ] });
+  return request;
+}

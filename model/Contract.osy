@@ -1,0 +1,271 @@
+// The contract a MODEL PROVIDER implements — Anthropic, OpenAI, Gemini, a self-hosted endpoint, your own gateway — and
+// the plain data that crosses it: a request in, a response or a stream of events out.
+//
+// ⚠ EVERYTHING HERE IS A WIRE CONTRACT. A block carries a `Kind` and the fields that kind uses, the way every
+// provider's own JSON does, rather than a class hierarchy: what crosses to a provider is plain data.
+
+namespace Osysharp.Llm;
+
+/// What one block of a message IS. The discriminator: each kind uses some of the fields below and leaves the rest null.
+public enum LlmBlockKind {
+  /// Plain text. Uses `Text`.
+  Text,
+  /// An image the model is asked to LOOK at. Uses `MediaType` and `DataBase64`.
+  Image,
+  /// The model asking for a tool to be run. Uses `ToolUseId`, `ToolName` and `InputJson`.
+  ToolUse,
+  /// The answer to one of those. Uses `ToolUseId`, `ResultJson` and `IsError`.
+  ToolResult,
+  /// A document the model is asked to READ — a PDF. Uses `MediaType` (`application/pdf`) and `DataBase64`.
+  Document,
+}
+
+/// One block of a message.
+///
+/// ⚠ FLAT, WITH A `Kind`, and deliberately so. A provider's own JSON is exactly this shape.
+public class LlmContentBlock {
+  public LlmBlockKind Kind = LlmBlockKind.Text;
+
+  /// `Text`: the words.
+  public string? Text;
+
+  /// `Image`: the IANA media type — `image/png`, `image/jpeg`, `image/webp` or `image/gif`. `Document`:
+  /// `application/pdf`.
+  public string? MediaType;
+  /// `Image` and `Document`: the bytes, base64. Never a URL — the bytes come from the app's own storage, and handing a provider a URL
+  /// would mean that storage had to be publicly reachable.
+  public string? DataBase64;
+
+  /// `ToolUse` and `ToolResult`: the id that pairs the two.
+  public string? ToolUseId;
+  /// `ToolUse`: what the model wants run, and the arguments it chose, as JSON.
+  public string? ToolName;
+  public string? InputJson;
+  /// `ToolResult`: what running it produced, as JSON, and whether that was a failure.
+  public string? ResultJson;
+  public bool IsError = false;
+}
+
+/// One message in the conversation. `Role` is "user" or "assistant" — the two every provider agrees on.
+public class LlmMessage {
+  public string Role = "user";
+  public List<LlmContentBlock> Content = [];
+
+  /// ⚑ A HINT, and a provider that ignores it is CORRECT. Anthropic's prompt caching places a breakpoint after this
+  /// message; other providers cache automatically or not at all.
+  public bool CacheBreakpoint = false;
+}
+
+/// How stable a piece of the system prompt is, so a provider that places cache breakpoints knows where to put them.
+public enum LlmCacheStability {
+  /// The same for every call this agent makes — its instructions and purpose.
+  AgentLevel,
+  /// The same within a session on one entity — retrieved context, entity state.
+  EntityLevel,
+  /// Different every turn. Never worth caching.
+  TurnLevel,
+}
+
+/// A piece of the system prompt, with how stable it is.
+public class LlmSystemSegment {
+  public string Content = "";
+  public LlmCacheStability Stability = LlmCacheStability.TurnLevel;
+}
+
+/// A tool the model may call. `InputSchemaJson` is a JSON Schema object — `Json.SchemaOf<T>()` writes one.
+public class LlmToolDefinition {
+  public string Name = "";
+  public string Description = "";
+  public string InputSchemaJson = "";
+}
+
+/// Whether the model may, must or may not call a tool this turn.
+public enum LlmToolChoice {
+  /// The model decides. What every provider does when nothing is said.
+  Auto,
+  /// It must call one of the tools — any of them.
+  Any,
+  /// It must not call a tool, though they stay declared (so a cached prefix holding them still matches).
+  None,
+  /// It must call the tool named in `LlmRequest.ToolChoiceName`.
+  Named,
+}
+
+/// One call to a model.
+public class LlmRequest {
+  /// The model to serve with — the provider's own id. ⛔ ALREADY DECIDED when a provider sees it: the app's router
+  /// chose it and `Llm.Complete` wrote it here. A provider serves what it is given and never substitutes — one that
+  /// second-guessed the decision would make every routing policy advisory.
+  public string Model = "";
+
+  /// The system prompt as one string, or `SystemSegments` for the structured form. When both are set, the segments win.
+  public string? SystemPrompt;
+  public List<LlmSystemSegment> SystemSegments = [];
+
+  public List<LlmMessage> Messages = [];
+  public List<LlmToolDefinition> Tools = [];
+
+  public decimal? Temperature;
+  public int? MaxTokens;
+  public decimal? TopP;
+
+  /// ⚑ A HINT, like `LlmMessage.CacheBreakpoint`: place a cache breakpoint after the last tool definition.
+  public bool CacheTools = false;
+
+  /// Whether the model may, must or may not call a tool this turn, and which one when it is `Named`.
+  public LlmToolChoice ToolChoice = LlmToolChoice.Auto;
+  public string? ToolChoiceName;
+
+  /// ⭐ STRUCTURED OUTPUT: a JSON Schema the answer must be a document of. Null: free text.
+  ///
+  /// A provider that can hold a model to a schema does so natively (OpenAI's `response_format`, Gemini's
+  /// `responseSchema`, a forced tool on Anthropic); one that cannot says so in the prompt. Either way the answer comes
+  /// back the same: ⛔ ONE `Text` block whose text is the JSON document — never a tool call the caller has to unwrap.
+  public string? OutputSchemaJson;
+  /// What the document is called where a provider wants a name for it (OpenAI's schema name, Anthropic's tool name).
+  /// Letters, digits and `_` only.
+  public string OutputName = "answer";
+}
+
+/// Why the model stopped.
+public enum LlmStopReason {
+  /// It finished what it had to say.
+  EndTurn,
+  /// It wants tools run — the response carries `ToolUse` blocks.
+  ToolUse,
+  /// It hit `MaxTokens` mid-answer.
+  MaxTokens,
+  /// It reached a stop sequence.
+  StopSequence,
+}
+
+/// What the model answered, all at once.
+///
+/// ⚠ THE TOKEN COUNTS ARE THE PROVIDER'S OWN, and the meter prices from them. Report what the provider reported —
+/// an estimate here becomes somebody's bill.
+public class LlmResponse {
+  public List<LlmContentBlock> Content = [];
+  public LlmStopReason StopReason = LlmStopReason.EndTurn;
+  public int InputTokens = 0;
+  public int OutputTokens = 0;
+  /// Prompt-cache accounting, when the provider reports it. 0 when it does not.
+  public int CacheCreationTokens = 0;
+  public int CacheReadTokens = 0;
+}
+
+/// What one streamed event IS. The discriminator, for the same reason `LlmBlockKind` is one.
+public enum LlmStreamEventKind {
+  /// More text. Uses `Delta`.
+  TextDelta,
+  /// The model has begun asking for a tool. Uses `ToolUseId` and `ToolName`.
+  ToolUseStart,
+  /// More of that tool's arguments. Uses `ToolUseId` and `InputDelta`.
+  ToolInputDelta,
+  /// That tool's arguments are complete. Uses `ToolUseId`.
+  ToolUseEnd,
+  /// ⛔ THE LAST EVENT OF EVERY STREAM, and it carries the token counts. Uses `StopReason` and the four counts. A
+  /// stream that ends without one is a call that cannot be metered — so a provider sends it even when the stream
+  /// failed, with whatever counts it has.
+  MessageComplete,
+}
+
+/// One event of a streamed answer.
+public class LlmStreamEvent {
+  public LlmStreamEventKind Kind = LlmStreamEventKind.TextDelta;
+
+  public string? Delta;
+  public string? ToolUseId;
+  public string? ToolName;
+  public string? InputDelta;
+
+  public LlmStopReason StopReason = LlmStopReason.EndTurn;
+  public int InputTokens = 0;
+  public int OutputTokens = 0;
+  public int CacheCreationTokens = 0;
+  public int CacheReadTokens = 0;
+
+  /// `MessageComplete`, as `Llm.Stream` hands it on — NOT a provider's to fill: the model that served the answer (by
+  /// the app's name), the router's rule that chose it, the call's id on the meter, and what it cost in millionths of
+  /// a US dollar. What `LlmResult` says of a call that is not streamed.
+  public string Model = "";
+  public string RouteRule = "";
+  public Guid? Call;
+  public long CostMicros = 0;
+}
+
+/// ⭐ WHAT A MODEL PROVIDER IMPLEMENTS. An app names one on each model it declares (`LlmModel.Client`), and
+/// `Llm.Complete` / `Llm.Stream` call it for every turn that model serves.
+///
+/// ⛔ WHAT SURROUNDS THIS CALL IS NOT THE PROVIDER'S, AND A PROVIDER CANNOT OPT OUT OF IT. The operator's AI switch,
+/// the budget reservation, the meter row and the fallback walk all happen in this package, around the call, from the
+/// token counts the provider reports. So a provider is never asked to police spend.
+///
+/// ⛔ AND THE MODEL IS ALREADY DECIDED. `request.Model` is what the app's router chose; a provider serves it or fails
+/// with an `ExternalServiceException`, which is what moves the call on to the next candidate.
+///
+/// SECURITY-INVARIANT(model-calls-are-metered-by-the-llm-kit). Guarded by AModelProviderIsCalledOnlyByTheLlmKitTests.
+/// ⛔ ONLY THIS PACKAGE CALLS IT. `Complete` and `Stream` are `internal`: any package may implement them — that is what
+/// a provider is — and only `Osysharp.Llm` may call them, which it does in exactly three places (`CompleteWith`,
+/// `StreamWith`, `DecideWith`), each of which routes, reserves and meters around the call. An app or another package
+/// that holds a client (`new AnthropicClient { … }` kept in a field of its own) and writes `client.Complete(request)`
+/// does not compile; it calls `Llm.Complete`. So no model call is made that is not on the meter.
+///
+/// A provider writes its own two methods `internal` as well — an implementation may not be wider than the member it
+/// answers.
+public interface ILlmClient {
+  /// The whole answer, once it is ready.
+  internal LlmResponse Complete(LlmRequest request);
+
+  /// The answer as it arrives, ending with a `MessageComplete` event carrying the token counts.
+  internal stream<LlmStreamEvent> Stream(LlmRequest request);
+}
+
+// ── typed decisions ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// One typed decision asked of a model: some state in, a value of a known shape out, with how sure the model is.
+public class LlmDecisionRequest {
+  /// The model to serve with — the provider's own id, already decided, as for `LlmRequest.Model`.
+  public string Model = "";
+  /// What is being decided, in a sentence — "Which queue should this message go to?". May be empty: the shape says it.
+  public string Question = "";
+  /// The state to decide from: free text, or a JSON document.
+  public string Input = "";
+  /// The JSON Schema of the value to return — an enum, a number, a record.
+  public string SchemaJson = "";
+}
+
+/// One alternative a decision weighed, and the share of its confidence that went there.
+public class LlmDecisionChoice {
+  /// The alternative, as JSON of the decided type.
+  public string ValueJson = "";
+  public decimal Confidence = 0;
+}
+
+/// What a decision model answered.
+public class LlmDecision {
+  /// The decided value, as a JSON document of the schema asked for.
+  public string ValueJson = "";
+  /// How sure the model is, 0 to 1.
+  public decimal Confidence = 0;
+  /// Whether `Confidence` is CALIBRATED — measured, so that "0.9" is right nine times in ten — or the model's own
+  /// estimate of itself. A purpose-built decision model reports the first; a chat model asked to rate itself the second.
+  public bool Calibrated = false;
+  /// The alternatives it weighed, most likely first, when the model reports them. Empty when it does not.
+  public List<LlmDecisionChoice> Alternatives = [];
+  /// The provider's own counts, as for `LlmResponse`.
+  public int InputTokens = 0;
+  public int OutputTokens = 0;
+}
+
+/// ⭐ WHAT A TYPED-DECISION MODEL IMPLEMENTS — a model built to return a value of a schema given in advance, with a
+/// confidence, rather than text: a classifier, a scorer, an extractor. An app names one on a model it declares
+/// (`LlmModel.Decider`), and `Llm.Decide<T>` calls it.
+///
+/// The contract is the KIND of model, not a vendor: a hosted API and a self-hosted open-weight model are each a class
+/// implementing this. A model that only chats needs none — `Llm.Decide<T>` asks a chat model the same question
+/// through `ILlmClient`, slower and with an uncalibrated confidence.
+///
+/// ⛔ ONLY THIS PACKAGE CALLS IT, as for `ILlmClient`: `Decide` is `internal`, and `Llm.Decide<T>` is how it is reached.
+public interface IDecisionModel {
+  internal LlmDecision Decide(LlmDecisionRequest request);
+}

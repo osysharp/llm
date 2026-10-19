@@ -1,0 +1,404 @@
+// Osysharp.Llm — budgets: room is reserved before a call leaves, a call that does not fit is refused with nothing
+// sent, calls reserving at once cannot both take the last of the room, and only the kit counts.
+//
+// The numbers. `Summarise("beans")` sends a prompt of 12 tokens. To the small model ($1 in, $5 out, per million) it
+// may run to 1000 tokens of answer, so a call reserves 5012 millionths of a dollar before it leaves. The script then
+// says what it really used, and that is what is counted.
+using Osysharp.Llm;
+using SeedBank;
+
+// ── a hard limit ────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Bank)]
+void a_call_that_does_not_fit_its_budget_is_refused_before_anything_is_sent() {
+  ScriptedAnswer.Stub((model, request) => { new Heard { What = "asked", About = model }; return Scripted.Text("A line.", 1000, 200); });
+  runas (Tove) { SetBudget("app", "", LlmBudgetWindow.Day, 0.01m); UnitOfWork.Commit(); }      // a cent a day
+
+  runas (Ines) {
+    Summarise("beans");       // reserves 5012 of 10000, costs 2000
+    Summarise("beans");       // 2000 spent + 5012 fits; 4000 spent
+    Summarise("beans");       // 4000 + 5012 fits; 6000 spent
+    var refused = Assert.Throws<LlmBudgetExceeded>(() => Summarise("beans"));     // 6000 + 5012 does not
+    Assert.Equal("app", refused.Scope);
+    Assert.Equal(LlmBudgetWindow.Day, refused.Window);
+    Assert.Equal(4000, refused.LeftMicros);
+    Assert.Contains("no room left in the app budget for today (limit $0.01)", refused.Message);
+    Assert.Contains("Nothing was sent", refused.Message);
+
+    // The provider heard three calls, not four…
+    Assert.Equal(3, Heard.Count(h => h.What == "asked"));
+    // …the fourth is on the meter as refused, at no cost…
+    var last = ModelCall.OrderByDescending(c => c.At).First();
+    Assert.Equal(ModelCallOutcome.OverBudget, last.Outcome);
+    Assert.Equal(0, last.CostMicros);
+    // …and the budget counted three calls, 6000 millionths, and one refusal.
+    var spend = LlmSpend.Single();
+    Assert.Equal(6000, spend.SpentMicros);
+    Assert.Equal(3, spend.Calls);
+    Assert.Equal(1, spend.Refused);
+    Assert.Equal(0.006m, SpentIn("app", "", LlmBudgetWindow.Day));
+    // Nothing is left held once every call has reported back.
+    Assert.Equal(0, LlmHold.Count());
+  }
+  Background.Settle();
+  runas (Ines) { Assert.Equal(1, Heard.Count(h => h.What == "spent" && h.About == "app:")); }
+}
+
+[Test(Bank)]
+void a_call_whose_provider_failed_gives_its_room_back() {
+  ScriptedAnswer.Stub((model, request) => {
+    if (Heard.Count(h => h.What == "fail") > 0) { throw new ExternalServiceException(model + " is down"); }
+    return Scripted.Text("A line.", 1000, 200);
+  });
+  runas (Tove) { SetBudget("app", "", LlmBudgetWindow.Day, 0.2m); UnitOfWork.Commit(); }
+  runas (Ines) {
+    new Heard { What = "fail" };
+    UnitOfWork.Commit();
+    Assert.Throws<ExternalServiceException>(() => Summarise("beans"));
+    // Two attempts, both failed: nothing spent, nothing still held.
+    Assert.Equal(0, LlmSpend.Single().SpentMicros);
+    Assert.Equal(0, LlmHold.Count());
+  }
+}
+
+[Test(Bank)]
+void a_new_day_is_a_new_allowance_and_a_total_never_starts_over() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("A line.", 0, 1000));      // 5000 each
+  runas (Tove) {
+    SetBudget("app", "", LlmBudgetWindow.Day, 0.006m);
+    SetBudget("app", "", LlmBudgetWindow.Total, 0.016m);
+    UnitOfWork.Commit();
+  }
+  runas (Ines) {
+    Summarise("beans");
+    Assert.Throws<LlmBudgetExceeded>(() => Summarise("beans"));          // today's 6000 has 1000 left
+  }
+  TestClock.Advance(TimeSpan.FromDays(1));
+  runas (Ines) {
+    Summarise("beans");                                                   // a new day
+    var refused = Assert.Throws<LlmBudgetExceeded>(() => Summarise("beans"));
+    Assert.Equal(LlmBudgetWindow.Day, refused.Window);
+  }
+  TestClock.Advance(TimeSpan.FromDays(1));
+  runas (Ines) {
+    Summarise("beans");                                                   // 15000 of the total's 16000
+  }
+  TestClock.Advance(TimeSpan.FromDays(1));
+  runas (Ines) {
+    // A new day again — and the total has 1000 left, whatever day it is.
+    var refused = Assert.Throws<LlmBudgetExceeded>(() => Summarise("beans"));
+    Assert.Equal(LlmBudgetWindow.Total, refused.Window);
+    Assert.Equal(1000, refused.LeftMicros);
+  }
+}
+
+// ── whose budget ────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Bank)]
+void a_budget_for_every_person_gives_each_their_own_allowance() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("A line.", 1000, 200));
+  runas (Tove) { SetBudget("requester", "", LlmBudgetWindow.Day, 0.006m); UnitOfWork.Commit(); }
+  runas (Ines) {
+    Summarise("beans");
+    var refused = Assert.Throws<LlmBudgetExceeded>(() => Summarise("beans"));
+    Assert.Equal("requester", refused.Scope);
+    Assert.Equal(Ines.Id.ToString(), refused.Subject);
+  }
+  // Ines has spent hers; Omar has not touched his.
+  runas (Omar) { Summarise("beans"); }
+  runas (Ines) {
+    Assert.Equal(0.002m, SpentIn("requester", Ines.Id.ToString(), LlmBudgetWindow.Day));
+    Assert.Equal(0.002m, SpentIn("requester", Omar.Id.ToString(), LlmBudgetWindow.Day));
+  }
+}
+
+[Test(Bank)]
+void a_budget_naming_one_person_overrides_the_one_for_everybody() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("A line.", 1000, 200));
+  runas (Tove) {
+    SetBudget("requester", "", LlmBudgetWindow.Day, 1m);
+    SetBudget("requester", Omar.Id.ToString(), LlmBudgetWindow.Day, 0m);
+    UnitOfWork.Commit();
+  }
+  runas (Omar) { Assert.Throws<LlmBudgetExceeded>(() => Summarise("beans")); }
+  runas (Ines) { Summarise("beans"); }
+}
+
+[Test(Bank)]
+void a_scope_the_caller_names_has_a_budget_of_its_own() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("A line.", 1000, 200));
+  runas (Tove) { SetBudget("lot", "A1", LlmBudgetWindow.Total, 0.006m); UnitOfWork.Commit(); }
+  runas (Ines) {
+    SummariseFor("A1", "beans");
+    var refused = Assert.Throws<LlmBudgetExceeded>(() => SummariseFor("A1", "beans"));
+    Assert.Equal("lot", refused.Scope);
+    Assert.Equal("A1", refused.Subject);
+    // Another lot is not this one's budget.
+    SummariseFor("B2", "beans");
+    // A plain call names no lot at all.
+    Summarise("beans");
+  }
+}
+
+// ── at the limit: stop, or step down ────────────────────────────────────────────────────────────────────────────────
+
+[Test(Bank)]
+void at_a_budgets_limit_a_call_stops_unless_it_is_told_to_step_down() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("from " + model, 100, 100));
+  // Three cents for the viability study. Reasoning goes to the large model first, which may cost five.
+  runas (Tove) { SetBudget("study", "viability", LlmBudgetWindow.Total, 0.03m); UnitOfWork.Commit(); }
+  runas (Ines) {
+    var refused = Assert.Throws<LlmBudgetExceeded>(() => Reason("Is a ten-year-old bean still viable?", false));
+    Assert.Equal("study", refused.Scope);
+    Assert.Equal(30000, refused.LeftMicros);
+    Assert.Equal(0, ModelCall.Count(c => c.Outcome == ModelCallOutcome.Served));
+  }
+}
+
+[Test(Bank)]
+void a_spent_budget_steps_down_when_the_call_says_so() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("from " + model, 100, 100));
+  runas (Tove) { SetBudget("study", "viability", LlmBudgetWindow.Total, 0.03m); UnitOfWork.Commit(); }
+  runas (Ines) {
+    var result = Reason("Is a ten-year-old bean still viable?", true);
+    // The large model did not fit what is left; the router was asked again with that as the ceiling, and the small one served.
+    Assert.Equal("from Small", result.Text());
+    Assert.Equal("Small", result.Model);
+    var attempts = ModelCall.Where(c => c.Call == result.Call).OrderBy(c => c.Attempt).ToList();
+    Assert.Equal(2, attempts.Count);
+    Assert.Equal("Large", attempts[0].Model);
+    Assert.Equal(ModelCallOutcome.OverBudget, attempts[0].Outcome);
+    Assert.Equal("Small", attempts[1].Model);
+    Assert.Equal(ModelCallOutcome.Served, attempts[1].Outcome);
+    // The serving attempt's record says why the large model is not on it: the ceiling.
+    Assert.Contains("its worst case costs more than this call may spend", attempts[1].Rejected!);
+    var facts = JsonSerializer.Deserialize<LlmTaskFacts>(attempts[1].Facts!);
+    Assert.Equal(30000, facts.MaxCostMicros);
+  }
+}
+
+[Test(Bank)]
+void a_budget_may_itself_say_to_step_down() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("from " + model, 100, 100));
+  runas (Tove) { SetBudget("study", "viability", LlmBudgetWindow.Total, 0.03m, LlmOnLimit.StepDown); UnitOfWork.Commit(); }
+  runas (Ines) { Assert.Equal("Small", Reason("Is a ten-year-old bean still viable?", false).Model); }
+}
+
+[Test(Bank)]
+void stepping_down_stops_when_nothing_cheaper_fits_either() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("from " + model, 100, 100));
+  runas (Tove) { SetBudget("study", "viability", LlmBudgetWindow.Total, 0.001m); UnitOfWork.Commit(); }
+  runas (Ines) {
+    Assert.Throws<LlmBudgetExceeded>(() => Reason("Is a ten-year-old bean still viable?", true));
+    Assert.Equal(0, ModelCall.Count(c => c.Outcome == ModelCallOutcome.Served));
+  }
+}
+
+[Test(Bank)]
+[runas(Ines)]
+void a_call_may_carry_a_ceiling_of_its_own() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("from " + model, 100, 100));
+  // Six thousandths of a dollar: the small model's worst case fits, the large one's does not.
+  var fits = await Llm.Complete(RequestOf("beans"), new LlmCall { Kind = LlmTaskKind.Reason, MaxCostMicros = 6000 });
+  Assert.Equal("Small", fits.Model);
+  Assert.Throws<LlmRouteDenied>(() => await Llm.Complete(RequestOf("beans"), new LlmCall { MaxCostMicros = 100 }));
+}
+
+// ── at once ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Bank)]
+void a_budget_reserves_atomically_under_parallel_calls() {
+  // Twelve calls at once against two cents. Each reserves 5012 and — the script says — costs 5000; the hashing keeps
+  // each call in flight long enough for the others to arrive. Three fit (15036 held); a fourth never does, in any
+  // order: 15000 spent + 5012 is still more than 20000.
+  ScriptedAnswer.Stub((model, request) => { Security.HashPassword("a model that takes its time"); return Scripted.Text("A line.", 0, 1000); });
+  runas (Tove) { SetBudget("app", "", LlmBudgetWindow.Day, 0.02m); UnitOfWork.Commit(); }
+  runas (Ines) {
+    SummariseAllThatFit(["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"]);
+    Assert.Equal(3, ModelCall.Count(c => c.Outcome == ModelCallOutcome.Served));
+    Assert.Equal(9, ModelCall.Count(c => c.Outcome == ModelCallOutcome.OverBudget));
+    var spend = LlmSpend.Single();
+    Assert.Equal(15000, spend.SpentMicros);
+    Assert.Equal(3, spend.Calls);
+    Assert.Equal(0, LlmHold.Count());
+  }
+}
+
+[Test(Bank)]
+void a_model_serves_only_as_many_calls_at_once_as_it_allows() {
+  // Eight calls at once to the model that takes two at a time; the router puts the small one behind it.
+  ScriptedAnswer.Stub((model, request) => { Security.HashPassword("a model that takes its time"); return Scripted.Text("from " + model); });
+  runas (Ines) {
+    SummariseAllNarrowly(["a", "b", "c", "d", "e", "f", "g", "h"]);
+    // Every call was served — by the narrow model while it had a place, by the small one when it had none.
+    Assert.Equal(8, ModelCall.Count(c => c.Outcome == ModelCallOutcome.Served));
+    Assert.True(ModelCall.Count(c => c.Outcome == ModelCallOutcome.Busy && c.Model == "Narrow") >= 1);
+    Assert.True(ModelCall.Count(c => c.Outcome == ModelCallOutcome.Served && c.Model == "Small") >= 1);
+    Assert.Equal(0, LlmHold.Count());
+  }
+}
+
+// ── a limit the calling code declares ───────────────────────────────────────────────────────────────────────────────
+
+[Test(Bank)]
+[runas(Ines)]
+void a_limit_a_call_carries_is_reserved_against_before_the_call_leaves() {
+  // No budget is set anywhere: the limit is the code's own, a cent for lot A1 in all.
+  ScriptedAnswer.Stub((model, request) => { new Heard { What = "asked", About = model }; return Scripted.Text("A line.", 1000, 200); });
+  SummariseWithin("A1", 10000, "beans");       // reserves 5012 of 10000, costs 2000
+  SummariseWithin("A1", 10000, "beans");       // 2000 + 5012 fits; 4000 spent
+  SummariseWithin("A1", 10000, "beans");       // 4000 + 5012 fits; 6000 spent
+  var refused = Assert.Throws<LlmBudgetExceeded>(() => SummariseWithin("A1", 10000, "beans"));     // 6000 + 5012 does not
+  Assert.Equal("lot", refused.Scope);
+  Assert.Equal("A1", refused.Subject);
+  Assert.Equal(LlmBudgetWindow.Total, refused.Window);
+  Assert.Equal(4000, refused.LeftMicros);
+  Assert.Contains("no room left in the limit set for lot:A1 ($0.01)", refused.Message);
+  Assert.Contains("Nothing was sent", refused.Message);
+
+  // The provider heard three calls; the fourth is on the meter as refused; the lot's count is three calls.
+  Assert.Equal(3, Heard.Count(h => h.What == "asked"));
+  Assert.Equal(ModelCallOutcome.OverBudget, ModelCall.OrderByDescending(c => c.At).First().Outcome);
+  Assert.Equal(0.006m, SpentAgainst("lot:A1"));
+  Assert.Equal(0, LlmHold.Count());
+  // The scope is one the calls were charged to, like any they named.
+  Assert.Equal(0.006m, SpentOn("lot:A1"));
+}
+
+[Test(Bank)]
+[runas(Ines)]
+void a_limit_binds_only_the_calls_that_carry_it() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("A line.", 1000, 200));
+  // Somebody's code holds its own calls for the whole app to nothing…
+  Assert.Throws<LlmBudgetExceeded>(() => await Llm.Complete(RequestOf("Summarise: beans"),
+    new LlmCall { Limits = [ new LlmLimit { Scope = "app", LimitMicros = 0 } ] }));
+  // …and that is nobody else's limit: a call that carries none is served, and so is one for another lot.
+  Assert.Equal("A line.", Summarise("beans"));
+  Assert.Equal("A line.", SummariseWithin("B2", 10000, "beans"));
+  // A lot's count is its own.
+  Assert.Equal(0.002m, SpentAgainst("lot:B2"));
+  Assert.Equal(0m, SpentAgainst("lot:A1"));
+}
+
+/// Asked before a call and again after it, in one unit of work, `SpentAgainst` answers the figure as it stands each
+/// time — the call settled in a unit of work of its own, and the second answer includes it. The call is the plain
+/// one, a prompt with the call said in full (`Llm.Complete(prompt, call)`).
+[Test(Bank)]
+[runas(Ines)]
+void what_a_limit_has_spent_is_the_figure_now_when_asked_twice_around_a_call() {
+  ScriptedAnswer.Stub((model, request) => { new Heard { What = "asked", About = Scripted.Asked(request) }; return Scripted.Text("A line.", 1000, 200); });
+  SummariseWithin("A1", 1000000, "beans");
+  Assert.Equal(0.002m, SpentAgainst("lot:A1"));
+  var result = await Llm.Complete("Summarise: more beans", new LlmCall {
+    Purpose = "summary", Limits = [ new LlmLimit { Scope = "lot:A1", LimitMicros = 1000000 } ],
+  });
+  Assert.Equal("A line.", result.Text());
+  Assert.Equal(2000, result.CostMicros);
+  Assert.Equal(1, Heard.Count(h => h.What == "asked" && h.About == "Summarise: more beans"));
+  Assert.Equal("summary", ModelCall.OrderByDescending(c => c.At).First().Purpose);
+  Assert.Equal(0.004m, SpentAgainst("lot:A1"));
+}
+
+[Test(Bank)]
+[runas(Ines)]
+void a_declared_limit_reserves_atomically_under_parallel_calls() {
+  // Twelve calls at once against two cents for one lot: three fit (15036 held), a fourth never does.
+  ScriptedAnswer.Stub((model, request) => { Security.HashPassword("a model that takes its time"); return Scripted.Text("A line.", 0, 1000); });
+  SummariseAllWithin("A1", 20000, ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"]);
+  Assert.Equal(3, ModelCall.Count(c => c.Outcome == ModelCallOutcome.Served));
+  Assert.Equal(9, ModelCall.Count(c => c.Outcome == ModelCallOutcome.OverBudget));
+  Assert.Equal(0.015m, SpentAgainst("lot:A1"));
+  Assert.Equal(0, LlmHold.Count());
+}
+
+[Test(Bank)]
+void a_budget_still_binds_a_call_that_carries_a_wider_limit() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("A line.", 1000, 200));
+  runas (Tove) { SetBudget("app", "", LlmBudgetWindow.Day, 0.006m); UnitOfWork.Commit(); }
+  runas (Ines) {
+    SummariseWithin("A1", 1000000, "beans");                                        // a dollar for the lot; 2000 spent
+    var refused = Assert.Throws<LlmBudgetExceeded>(() => SummariseWithin("A1", 1000000, "beans"));   // the app's 6000 has 4000 left
+    Assert.Equal("app", refused.Scope);
+  }
+}
+
+[Test(Bank)]
+[runas(Ines)]
+void what_a_limit_has_counted_is_changed_only_by_the_call_path() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("A line.", 1000, 200));
+  SummariseWithin("A1", 10000, "beans");
+  Assert.Denied(() => { ForgetWhatALotSpent(); UnitOfWork.Commit(); });
+  UnitOfWork.Discard();
+  Assert.Denied(() => { ForgeAllowance(); UnitOfWork.Commit(); });
+  UnitOfWork.Discard();
+  Assert.Equal(0.002m, SpentAgainst("lot:A1"));
+}
+
+// ── telling somebody ────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Bank)]
+void a_budget_warns_once_when_it_is_nearly_spent() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("A line.", 1000, 200));
+  runas (Tove) { SetBudget("app", "", LlmBudgetWindow.Day, 0.02m, LlmOnLimit.Stop, 0.25m); UnitOfWork.Commit(); }
+  runas (Ines) {
+    Summarise("beans");       // 2000 of 20000: below a quarter
+    Summarise("beans");       // 4000
+    Summarise("beans");       // 6000: past it — warned
+    Summarise("beans");       // 8000: not again
+  }
+  Background.Settle();
+  runas (Ines) {
+    var heard = Heard.Where(h => h.What == "nearly spent").ToList();
+    Assert.Equal(1, heard.Count);
+    Assert.Equal("app: 6000/20000", heard[0].About);
+  }
+}
+
+// ── whose counts they are ───────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Bank)]
+void budgets_are_set_only_by_who_manages_the_spend_and_only_through_the_kit() {
+  runas (Ines) { Assert.Throws<NotAuthorized>(() => SetBudget("app", "", LlmBudgetWindow.Day, 100m)); }
+  runas (Tove) { Assert.Denied(() => ForgeBudget()); UnitOfWork.Discard(); }
+  runas (Tove) {
+    SetBudget("app", "", LlmBudgetWindow.Day, 0.01m);
+    UnitOfWork.Commit();
+    // Setting it again changes the one there is.
+    SetBudget("app", "", LlmBudgetWindow.Day, 0.05m);
+    UnitOfWork.Commit();
+    Assert.Equal(50000, LlmBudget.Single().LimitMicros);
+    Assert.True(RemoveBudget("app", "", LlmBudgetWindow.Day));
+    UnitOfWork.Commit();
+    Assert.Equal(0, LlmBudget.Count());
+    Assert.False(RemoveBudget("app", "", LlmBudgetWindow.Day));
+  }
+}
+
+[Test(Bank)]
+void what_a_budget_has_counted_is_changed_only_by_the_call_path() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("A line.", 1000, 200));
+  runas (Tove) { SetBudget("app", "", LlmBudgetWindow.Day, 0.006m); UnitOfWork.Commit(); }
+  runas (Ines) { Summarise("beans"); }
+  // Nobody turns the count back — not a caller, not the treasurer.
+  runas (Ines) { Assert.Denied(() => { ForgetWhatWasSpent(); UnitOfWork.Commit(); }); UnitOfWork.Discard(); }
+  runas (Tove) { Assert.Denied(() => { ForgetWhatWasSpent(); UnitOfWork.Commit(); }); UnitOfWork.Discard(); }
+  runas (Ines) {
+    Assert.Equal(2000, LlmSpend.Single().SpentMicros);
+    Assert.Throws<LlmBudgetExceeded>(() => Summarise("beans"));
+  }
+}
+
+/// ⭐ WHOEVER RAN IT IS TOLD WHY. A model call refused for money inside an action answers the action's caller with the
+/// kit's own sentence — a refusal, not "it failed for a reason the app did not foresee".
+[Test(Bank)]
+void a_refused_call_inside_an_action_tells_the_actions_caller_why() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("A line.", 1000, 200));
+  runas (Tove) { SetBudget("app", "", LlmBudgetWindow.Day, 0.004m); UnitOfWork.Commit(); }     // less than one call reserves
+  runas (Ines) {
+    var result = Actions.Run(Actions.Of(SummariseAsATool).Name, [new ActionValue { Parameter = "note", Value = "beans" }]);
+    Assert.Equal(ActionOutcome.Invalid, result.Outcome);
+    Assert.Equal("There is no room left in the app budget for today (limit $0.0040). Nothing was sent.", result.Problem);
+    // It is still caught as what it is.
+    Assert.Throws<LlmBudgetExceeded>(() => Summarise("beans"));
+  }
+}

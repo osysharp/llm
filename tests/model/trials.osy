@@ -1,0 +1,56 @@
+// A germination trial — a workflow that reads a note with a model, so a test can see what a call made in a run is
+// charged to.
+namespace SeedBank;
+
+using Osysharp.Llm;
+using Osysharp.Workflow;
+
+public enum TrialStatus { Sown, Read, Abandoned }
+
+/// One germination trial of a lot.
+entity Trial {
+  [Required, MaxLength(40)] string Lot;
+  TrialStatus Status = TrialStatus.Sown;
+  /// How many times the note is read in the one run.
+  int Readings = 1;
+  /// The reading says itself what it is charged to — the lot — and not the run it is made in.
+  bool ChargedToTheLot = false;
+  [MaxLength(400)] string Finding = "";
+  /// The run that read it, as the run itself says.
+  Guid? Run;
+  security { allow read, create, update when IsAuthenticated; }
+}
+
+/// Reads the note as many times as the trial asks, in one run. A reading the money does not reach ends the trial.
+workflow TrialFlow {
+  Tracks = Trial.Status; Autostart = false; Initial = Sown;
+  state Sown {
+    enter {
+      this.Item.Run = Workflow.Current?.Id;
+      try {
+        for (var i = 0; i < this.Item.Readings; i = i + 1) {
+          this.Item.Finding = this.Item.ChargedToTheLot ? SummariseForTheLotAlone(this.Item.Lot) : Summarise("trial of " + this.Item.Lot);
+        }
+      } catch (LlmBudgetExceeded e) {
+        this.Item.Finding = "The money ran out: " + e.Scope + " " + e.Subject;
+        goto Abandoned;
+      }
+      goto Read;
+    }
+  }
+  terminal success Read { }
+  terminal cancel  Abandoned { }
+}
+
+/// A reading that names what it is charged to itself.
+string SummariseForTheLotAlone(string lot) {
+  var answer = await Llm.Complete("Summarise the trial of " + lot, new LlmCall { Scopes = ["lot:" + lot], ChargedToItsRun = false });
+  return answer.Text();
+}
+
+/// Run a trial of a lot, reading its note `readings` times.
+Trial RunTrial(string lot, int readings = 1, bool chargedToTheLot = false) {
+  var trial = new Trial { Lot = lot, Readings = readings, ChargedToTheLot = chargedToTheLot };
+  Workflow.Run(trial);
+  return trial;
+}

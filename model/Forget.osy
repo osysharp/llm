@@ -1,0 +1,46 @@
+// Taking a person off the meter. What a call cost stays counted; whose it was does not.
+namespace Osysharp.Llm;
+
+/// Whether a call made for `requester` is still on its way: room is held for it against a budget of theirs, and it
+/// has not reported back. A person is taken off the meter once nothing of theirs is in flight.
+public bool ModelCallsInFlightFor(Guid requester) {
+  var subject = requester.ToString();
+  foreach (var spend in LlmSpend.Where(s => s.Budget.Scope == "requester" && s.Subject == subject).ToList()) {
+    if (LlmHold.Any(h => h.Spend == spend)) { return true; }
+  }
+  return false;
+}
+
+/// ⭐ TAKE A PERSON OFF THE METER: every row of a call made for `requester` loses who it was for — the row, the model,
+/// the tokens and the cost stay, charged to the same app, model and named scopes as before — and what was counted
+/// against budgets of their own (a limit for each person, or one set for them by name) goes, with a budget that
+/// names them. With `before`, only what is older than that moment, and their budgets are left alone. Answers how
+/// many rows of the meter were theirs.
+///
+/// Refused while a call for them is still on its way (`ModelCallsInFlightFor`).
+[Server, Authorize(ManagesModelSpend)]
+public int ForgetModelCallRequester(Guid requester, DateTime? before = null) {
+  if (ModelCallsInFlightFor(requester)) {
+    throw new ValidationException("A model call for them is still on its way. Take them off the meter when it has reported back.");
+  }
+  var subject = requester.ToString();
+  var scope = "requester:" + subject;
+  var rows = before == null
+    ? ModelCall.Where(c => c.Requester == requester).ToList()
+    : ModelCall.Where(c => c.Requester == requester && c.At < before).ToList();
+  foreach (var row in rows) {
+    row.Requester = null;
+    row.Scopes = string.Join("\n", row.Scopes.Split("\n").Where(line => line != scope).ToList());
+  }
+  if (before == null) {
+    foreach (var spend in LlmSpend.Where(s => s.Budget.Scope == "requester" && s.Subject == subject).ToList()) { spend.Delete(); }
+    foreach (var budget in LlmBudget.Where(b => b.Scope == "requester" && b.Subject == subject).ToList()) { budget.Delete(); }
+    foreach (var allowance in LlmAllowance.Where(a => a.Scope == scope).ToList()) { allowance.Delete(); }
+  } else {
+    var day = DateOnly.FromDateTime(before!.Value);
+    foreach (var spend in LlmSpend.Where(s => s.Budget.Scope == "requester" && s.Subject == subject && s.Period < day && s.Budget.Window != LlmBudgetWindow.Total).ToList()) {
+      spend.Delete();
+    }
+  }
+  return rows.Count;
+}

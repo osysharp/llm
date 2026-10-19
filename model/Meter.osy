@@ -1,0 +1,171 @@
+// The meter — one row for every attempt to call a model: which model, why that one, what it used, what it cost —
+// and the price book the cost is worked out from.
+namespace Osysharp.Llm;
+
+/// How a call reached the model.
+public enum ModelCallKind { Complete, Stream, Decide }
+
+/// How one attempt ended.
+public enum ModelCallOutcome {
+  /// The provider answered, and this is what it used.
+  Served,
+  /// The provider failed or refused; the call moved to the next candidate, or failed with this one.
+  Failed,
+  /// A budget had no room for it, or it could cost more than the call may spend. Nothing was sent.
+  OverBudget,
+  /// The model was already serving as many calls as it allows. Nothing was sent.
+  Busy,
+}
+
+/// ⭐ ONE ATTEMPT TO CALL A MODEL. A call that fell back twice is three rows, sharing `Call`.
+///
+/// A row is written once, when the attempt is over, and never changed — except that who it was for can be taken
+/// off it (`ForgetModelCallRequester`). It is written only by this package's own call path: the app, a page, an
+/// import and another package can read what the app's policy lets them read, and can write nothing.
+public entity ModelCall {
+  /// The call this attempt belongs to — every attempt of one `Llm.Complete` shares it.
+  [Required, Immutable, Index] Guid Call;
+  /// Which try it was: 0 for the router's first candidate.
+  [Immutable] int Attempt = 0;
+  [Immutable] DateTime At = DateTime.UtcNow;
+  [Immutable] ModelCallKind Kind = ModelCallKind.Complete;
+  [Immutable] ModelCallOutcome Outcome = ModelCallOutcome.Served;
+  /// The app's name for the model, and the provider's id for it.
+  [Required, Immutable, MaxLength(200), Index] string Model;
+  [Immutable, MaxLength(200)] string ProviderModel = "";
+  /// The model that failed before this one was tried. Null when none had.
+  [Immutable, MaxLength(200)] string? FallbackFrom;
+
+  /// Why this model: the rule of the app's router that ordered the candidates, the facts it decided from, and each
+  /// model it dropped with the reason. The facts are kept whole so a decision can be replayed against another policy.
+  [Immutable, MaxLength(200)] string RouteRule = "";
+  [Immutable] Json? Facts;
+  [Immutable] Json? Rejected;
+
+  /// Who asked — the signed-in person the call ran for. Null for the system, and once they were taken off the meter.
+  [Index, Classification(Personal.Identity)] Guid? Requester;
+  /// What the call is charged to — `app:`, `requester:<id>`, `model:<name>` and the scopes its caller named, one per line.
+  [MaxLength(2000)] string Scopes = "";
+  /// What the call was for, in the caller's words. Never the prompt.
+  [Immutable, MaxLength(200)] string Purpose = "";
+
+  /// The provider's own counts.
+  [Immutable] int InputTokens = 0;
+  [Immutable] int OutputTokens = 0;
+  [Immutable] int CacheReadTokens = 0;
+  [Immutable] int CacheWriteTokens = 0;
+  /// What it cost, in millionths of a US dollar, at the price in force when it was made.
+  [Immutable] long CostMicros = 0;
+  /// The price-book row it was priced from. Null: the price on the model's own declaration.
+  [Immutable] ModelPrice? Price;
+  /// What was held against the budgets before the provider was called.
+  [Immutable] long ReservedMicros = 0;
+  [Immutable] int DurationMs = 0;
+  /// What the provider said when it failed, or which budget refused.
+  [Immutable, MaxLength(2000)] string? Problem;
+
+  security {
+    // Whoever manages spend reads the rows too: they are who deletes old ones and takes a person off them, and a row
+    // nobody may read is a row nobody can find.
+    allow read when ReadsModelUsage || ManagesModelSpend;
+    allow create when UsesModels;
+    deny create except via RecordModelCall;
+    // SECURITY-INVARIANT(a-meter-row-changes-only-by-losing-who-it-was-for): every other member is immutable, and
+    // these two are written only by `ForgetModelCallRequester`, which takes a person OFF a row and can put nobody on
+    // one. A grant or an `except via` widened here lets what a call cost be moved to somebody else's name. Guarded by
+    // tests/forget.test.osy `only_whoever_manages_spend_takes_a_person_off_the_meter_and_only_through_the_kit`.
+    allow update when ManagesModelSpend;
+    deny update Requester, Scopes except via ForgetModelCallRequester;
+    allow delete when ManagesModelSpend;
+    deny delete except via ForgetModelCallsBefore;
+  }
+}
+
+/// ⭐ THE PRICE BOOK: what a million tokens cost on one model, from a moment on. A new price is a new row — a call is
+/// priced by the row in force when it was made and keeps pointing at it, so a re-price never rewrites what was spent.
+public entity ModelPrice {
+  /// The app's name for the model.
+  [Required, Immutable, MaxLength(200), Index] string Model;
+  [Immutable] DateTime From = DateTime.UtcNow;
+  /// US dollars per million tokens.
+  [Immutable, Min(0)] decimal Input = 0;
+  [Immutable, Min(0)] decimal Output = 0;
+  [Immutable, Min(0)] decimal CacheRead = 0;
+  [Immutable, Min(0)] decimal CacheWrite = 0;
+
+  security {
+    allow read when UsesModels || ReadsModelUsage || ManagesModelSpend;
+    allow create when ManagesModelSpend;
+    deny create except via SetModelPrice;
+  }
+}
+
+/// From `from` on (now, when null), a million tokens on `model` cost this many US dollars. Cached reads and writes
+/// cost what `input` does unless said. Earlier calls keep the price they were made at.
+[Server, Authorize(ManagesModelSpend)]
+public void SetModelPrice(string model, decimal input, decimal output, decimal? cacheRead = null, decimal? cacheWrite = null,
+                          DateTime? from = null) {
+  if (model.Trim() == "") { throw new ValidationException("Name the model the price is for — the app's own name for it."); }
+  new ModelPrice {
+    Model = model, From = from ?? DateTime.UtcNow, Input = input, Output = output,
+    CacheRead = cacheRead ?? input, CacheWrite = cacheWrite ?? input,
+  };
+}
+
+/// Everything a meter row says about an attempt before its outcome is known.
+public class ModelCallOpening {
+  public Guid Call;
+  public int Attempt = 0;
+  public ModelCallKind Kind = ModelCallKind.Complete;
+  public string Model = "";
+  public string ProviderModel = "";
+  public string? FallbackFrom;
+  public string RouteRule = "";
+  public string FactsJson = "";
+  public string RejectedJson = "";
+  public Guid? Requester;
+  public string Scopes = "";
+  public string Purpose = "";
+  public Guid? PriceRow;
+  public long ReservedMicros = 0;
+}
+
+/// ⭐ WRITE ONE METER ROW — in a unit of work of its own, so the row for an attempt that failed is still there after
+/// the call it belonged to has failed, and a call made in the middle of other work commits none of that work.
+[Server, Authorize(UsesModels), OwnUnitOfWork]
+internal void RecordModelCall(ModelCallOpening opening, ModelCallOutcome outcome, int inputTokens, int outputTokens,
+                              int cacheReadTokens, int cacheWriteTokens, long costMicros, int durationMs, string? problem) {
+  var price = opening.PriceRow == null ? null : ModelPrice.FirstOrDefault(p => p.Id == opening.PriceRow);
+  new ModelCall {
+    Call = opening.Call, Attempt = opening.Attempt, Kind = opening.Kind, Outcome = outcome,
+    Model = opening.Model, ProviderModel = opening.ProviderModel, FallbackFrom = opening.FallbackFrom,
+    RouteRule = opening.RouteRule, Facts = opening.FactsJson, Rejected = opening.RejectedJson,
+    Requester = opening.Requester, Scopes = opening.Scopes, Purpose = Clip(opening.Purpose, 200),
+    InputTokens = inputTokens, OutputTokens = outputTokens, CacheReadTokens = cacheReadTokens,
+    CacheWriteTokens = cacheWriteTokens, CostMicros = costMicros, Price = price,
+    ReservedMicros = opening.ReservedMicros, DurationMs = durationMs,
+    Problem = problem == null ? null : Clip(problem!, 2000),
+  };
+}
+
+string Clip(string text, int max) { return text.Length <= max ? text : text.Substring(0, max); }
+
+/// Delete the meter rows of calls made before `before`. Answers how many. What they cost stays counted against the
+/// budgets they fell under.
+[Server, Authorize(ManagesModelSpend)]
+public int ForgetModelCallsBefore(DateTime before) {
+  var old = ModelCall.Where(c => c.At < before).ToList();
+  foreach (var row in old) { row.Delete(); }
+  return old.Count;
+}
+
+/// What the calls charged to one scope cost in all, in US dollars — `SpentOn("task:" + task.Id)`, `SpentOn("app:")`.
+/// Read from the meter, so it answers for scopes no budget covers; the reader needs `ReadsModelUsage`.
+public decimal SpentOn(string scope) {
+  var wanted = scope.IndexOf(":") < 0 ? scope + ":" : scope;
+  decimal micros = 0;
+  foreach (var c in ModelCall.Where(c => c.Outcome == ModelCallOutcome.Served && c.Scopes.Contains(wanted)).ToList()) {
+    foreach (var line in c.Scopes.Split("\n")) { if (line == wanted) { micros = micros + c.CostMicros; } }
+  }
+  return micros / 1000000m;
+}

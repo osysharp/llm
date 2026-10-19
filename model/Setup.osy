@@ -1,0 +1,82 @@
+// What the app says: which models it has, how calls are routed among them, and who may do what.
+namespace Osysharp.Llm;
+
+/// Who may call a model at all. Everyone, until the app says otherwise: `policy UsesModels => IsStaff;`.
+virtual policy UsesModels => true;
+
+/// Who reads the meter — every call's model, tokens and cost. Nobody, until the app says:
+/// `policy ReadsModelUsage => IsFinance;`.
+virtual policy ReadsModelUsage => false;
+
+/// Who sets prices and budgets. Nobody, until the app says: `policy ManagesModelSpend => IsAdmin;`.
+virtual policy ManagesModelSpend => false;
+
+/// What a million tokens cost on one model, in US dollars. The meter multiplies these by the provider's own counts.
+public class LlmPrice {
+  /// A million tokens of prompt.
+  public decimal Input = 0;
+  /// A million tokens of answer.
+  public decimal Output = 0;
+  /// A million prompt tokens READ from the provider's cache — a fraction of `Input` on every provider that has one.
+  /// Null: the same as `Input`.
+  public decimal? CacheRead;
+  /// A million prompt tokens WRITTEN to the cache — a little more than `Input` on providers that charge for it.
+  /// Null: the same as `Input`.
+  public decimal? CacheWrite;
+}
+
+/// One model the app has credentials for.
+///
+///     new LlmModel { Name = "Fast", Client = new AnthropicClient { ApiKey = Secret.Anthropic }, Model = "claude-haiku-4-5",
+///                    Price = new LlmPrice { Input = 1, Output = 5 } }
+public class LlmModel {
+  /// The app's own name for it — "Fast", "Strong". What a call asks for, what a router orders, what the meter records.
+  public string Name = "";
+  /// The provider's id for it — "claude-haiku-4-5". What the provider is sent.
+  public string Model = "";
+  /// Who serves text and tool calls with it. Null for a model that only decides.
+  public ILlmClient? Client;
+  /// Who serves typed decisions with it (`Llm.Decide<T>`). Null for a model that only chats — it can still be asked to
+  /// decide, through `Client`.
+  public IDecisionModel? Decider;
+  /// What it costs, until the price book has a row for it (`SetModelPrice`). All zero: its calls are metered at no cost.
+  public LlmPrice Price = new LlmPrice();
+  /// The most tokens an answer may run to when the call does not say — what a reservation assumes.
+  public int MaxOutputTokens = 4096;
+  /// How many calls may be on their way to this model at once. 0: no cap. A call past the cap moves to the next
+  /// candidate, or is refused when there is none.
+  public int MaxConcurrent = 0;
+
+  // What a record of a call is written from. A setting is confined like a secret — its fields are not copied out — so
+  // the three facts a meter row needs are answered here, by the model itself.
+  public string NameOf() { return Name; }
+  public string ProviderModel() { return Model; }
+  public LlmPricePoint DeclaredPrice() {
+    return new LlmPricePoint { Input = Price.Input, Output = Price.Output,
+                               CacheRead = Price.CacheRead ?? Price.Input, CacheWrite = Price.CacheWrite ?? Price.Input };
+  }
+  public bool Chats() { return Client != null; }
+  public bool Decides() { return Decider != null; }
+}
+
+/// What a call does when a budget it falls under has no room for it.
+public enum LlmOnLimit {
+  /// Refuse the call (`LlmBudgetExceeded`). The default.
+  Stop,
+  /// Try a cheaper model the router admits for what is left; refuse when there is none.
+  StepDown,
+}
+
+/// How this app calls models — `app.Llm = new LlmSetup { … };`.
+[AppSetting("Llm")]
+public class LlmSetup {
+  /// Every model the app may serve with. A call can never reach one that is not here.
+  public List<LlmModel> Models = [];
+  /// The model a call gets when it asks for none and there is no router — by `Name`. Empty: the first in `Models`.
+  public string Default = "";
+  /// Which model serves which call, and in what order the others are tried when it fails. Null: every call goes to the
+  /// model it asked for, or to `Default`, and nothing is tried after it.
+  public ILlmRouter? Router;
+  /// How long a reservation holds a budget's room for a call that never reported back (a process that died mid-call).
+  public TimeSpan HoldFor = TimeSpan.FromMinutes(10);
+}

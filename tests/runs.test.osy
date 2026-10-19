@@ -1,0 +1,75 @@
+// Osysharp.Llm — a call made in a workflow's run is charged to the workflow and to that run, with nothing said at
+// the call; a budget for each run gives every run an allowance of its own; a call made anywhere else carries neither.
+//
+// The numbers are those of budgets.test.osy: a reading reserves 5012 millionths of a dollar before it leaves the
+// small model, and the script says it used 1000 tokens in and 200 out — 2000 millionths.
+using Osysharp.Llm;
+using Osysharp.Workflow;
+using SeedBank;
+
+[Test(Bank)]
+void a_call_made_in_a_run_is_charged_to_the_workflow_and_to_that_run() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("A line.", 1000, 200));
+  Guid id = Guid.Empty;
+  Guid? run = null;
+  runas (Ines) {
+    var trial = RunTrial("A1");
+    Workflow.Settle(trial);
+    Assert.Equal(TrialStatus.Read, trial.Status);
+    id = trial.Id;
+    run = trial.Run;
+    Assert.NotNull(run);
+    // A plain call, outside any run.
+    Summarise("beans");
+  }
+  runas (Ines) {
+    var calls = ModelCall.OrderBy(c => c.At).ToList();
+    Assert.Equal(2, calls.Count);
+    var inRun = calls[0].Scopes.Split("\n");
+    Assert.Contains("workflow:TrialFlow", inRun);
+    Assert.Contains(RunScope("TrialFlow", run!), inRun);
+    var plain = calls[1].Scopes;
+    Assert.False(plain.Contains("workflow:"));
+    Assert.False(plain.Contains("run."));
+    // What that run cost, and what the workflow has cost in all, read from the meter.
+    Assert.Equal(0.002m, SpentOn(RunScope("TrialFlow", run!)));
+    Assert.Equal(0.002m, SpentOn(WorkflowScope("TrialFlow")));
+  }
+}
+
+[Test(Bank)]
+void a_budget_for_each_run_gives_every_run_an_allowance_of_its_own() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("A line.", 1000, 200));
+  // Each run of a trial may spend 0.8 cents: one reading fits (it reserves 0.5012 and uses 0.2), a second does too
+  // (0.2 used + 0.5012 held), a third does not (0.4 used + 0.5012 held).
+  runas (Tove) { SetBudget(RunKind("TrialFlow"), "", LlmBudgetWindow.Total, 0.008m); UnitOfWork.Commit(); }
+  runas (Ines) {
+    var greedy = RunTrial("A1", readings: 3);
+    Workflow.Settle(greedy);
+    Assert.Equal(TrialStatus.Abandoned, greedy.Status);
+    Assert.Equal("The money ran out: run.TrialFlow " + greedy.Run!.ToString(), greedy.Finding);
+    // Another run of the same workflow has room of its own.
+    var modest = RunTrial("B2", readings: 2);
+    Workflow.Settle(modest);
+    Assert.Equal(TrialStatus.Read, modest.Status);
+    Assert.Equal(0.004m, SpentIn(RunKind("TrialFlow"), modest.Run!.ToString(), LlmBudgetWindow.Total));
+    Assert.Equal(0.004m, SpentIn(RunKind("TrialFlow"), greedy.Run!.ToString(), LlmBudgetWindow.Total));
+  }
+}
+
+[Test(Bank)]
+void a_call_that_says_what_it_is_charged_to_is_not_charged_to_the_run_it_is_made_in() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("A line.", 1000, 200));
+  runas (Ines) {
+    Assert.Equal(0, RunScopes().Count);                  // outside a run there is nothing to charge
+    var trial = RunTrial("A1", chargedToTheLot: true);
+    Workflow.Settle(trial);
+    Assert.Equal(TrialStatus.Read, trial.Status);
+  }
+  runas (Ines) {
+    var scopes = ModelCall.Single().Scopes.Split("\n");
+    Assert.Contains("lot:A1", scopes);
+    Assert.False(ModelCall.Single().Scopes.Contains("workflow:"));
+    Assert.False(ModelCall.Single().Scopes.Contains("run."));
+  }
+}

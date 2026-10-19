@@ -1,0 +1,8 @@
+// The producer's test project for Osysharp.Llm — a seed bank that reads the notes sent in with each seed lot. No model
+// is ever called: its three models are scripted (`ScriptedModel`), and a test writes their answers.
+app SeedBank {
+  model "model/**/*.osy";
+  tests "**/*.test.osy";
+  use Osysharp.Llm@2;
+  use Osysharp.Workflow;
+}

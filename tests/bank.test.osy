@@ -1,0 +1,20 @@
+// The seed bank's people and one lot — what every test of the kit starts from.
+using SeedBank;
+
+[TestFixture]
+void Bank() {
+  new Keeper { Name = "Ines", Curator = true };
+  new Keeper { Name = "Tove", Treasurer = true };
+  new Keeper { Name = "Omar" };
+  new Keeper { Name = "Rut", Barred = true };
+  new SeedLot { Code = "A1", Note = "Early dwarf beans, saved from the 2024 crop, dry stored." };
+}
+
+/// A curator: reads what the models cost.
+principal Ines => Keeper.Single(k => k.Name == "Ines");
+/// The treasurer: sets prices and budgets.
+principal Tove => Keeper.Single(k => k.Name == "Tove");
+/// A keeper with no say over the models' cost.
+principal Omar => Keeper.Single(k => k.Name == "Omar");
+/// Kept away from the models altogether.
+principal Rut  => Keeper.Single(k => k.Name == "Rut");

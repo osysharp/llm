@@ -1,0 +1,20 @@
+// The seed bank's models. In a file of its own with no `namespace`, because an `app.X = …` statement's value is
+// resolved outside the file's namespace.
+using Osysharp.Llm;
+using SeedBank;
+
+app.Llm = new LlmSetup {
+  Models = [
+    // Small and cheap; large and dear; and a model built to decide, which does not chat.
+    new LlmModel { Name = "Small",  Client = new ScriptedModel { Name = "Small" }, Model = "scripted-small",
+                   Price = new LlmPrice { Input = 1, Output = 5 }, MaxOutputTokens = 1000 },
+    new LlmModel { Name = "Large",  Client = new ScriptedModel { Name = "Large" }, Model = "scripted-large",
+                   Price = new LlmPrice { Input = 10, Output = 50, CacheRead = 1 }, MaxOutputTokens = 1000 },
+    new LlmModel { Name = "Sorter", Decider = new ScriptedModel { Name = "Sorter" }, Model = "scripted-sorter",
+                   Price = new LlmPrice { Input = 0.05m, Output = 0 } },
+    new LlmModel { Name = "Narrow", Client = new ScriptedModel { Name = "Narrow" }, Model = "scripted-narrow",
+                   Price = new LlmPrice { Input = 1, Output = 5 }, MaxOutputTokens = 1000, MaxConcurrent = 2 },
+  ],
+  Default = "Small",
+  Router = new SeedBankRouter(),
+};

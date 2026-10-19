@@ -1,0 +1,409 @@
+// Budgets — hard limits on what model calls may spend, reserved before a call leaves.
+namespace Osysharp.Llm;
+
+/// The period a budget's limit is for. `Total` never starts over.
+public enum LlmBudgetWindow { Day, Month, Total }
+
+/// ⭐ A LIMIT ON SPEND: at most `LimitMicros` in each `Window`, for the calls charged to one scope.
+///
+/// A scope is a KIND and a SUBJECT — `app` (no subject), `requester` and a person's id, `model` and a model's name,
+/// or whatever a caller names on its calls: `task:8f1c…`, `agent:Screener`. A budget with an empty `Subject` is for
+/// EVERY subject of its kind, each with an allowance of its own — "each person, five dollars a day" is one row.
+/// A budget naming a subject overrides that one for it.
+///
+/// Made and changed only by `SetBudget` and `RemoveBudget`.
+[Unique(Scope, Subject, Window)]
+public entity LlmBudget {
+  [Required, MaxLength(80)] string Scope;
+  [MaxLength(200)] string Subject = "";
+  LlmBudgetWindow Window = LlmBudgetWindow.Day;
+  /// The limit, in millionths of a US dollar.
+  [Min(0)] long LimitMicros = 0;
+  /// What a call does when there is no room: stop, or step down to a cheaper model. A call may say otherwise.
+  LlmOnLimit OnLimit = LlmOnLimit.Stop;
+  /// The share of the limit at which `LlmBudgetNearlySpent` is raised, once a period. 0: never.
+  [Min(0), Max(1)] decimal WarnAt = 0.8m;
+
+  security {
+    allow read when UsesModels || ManagesModelSpend || ReadsModelUsage;
+    allow create, update, delete when ManagesModelSpend;
+    deny create except via SetBudget;
+    deny update LimitMicros, OnLimit, WarnAt except via SetBudget;
+    deny delete except via RemoveBudget, ForgetModelCallRequester;
+  }
+}
+
+/// What one subject has spent against one budget in one period.
+///
+/// Written only by the call path.
+[Unique(Budget, Subject, Period)]
+public entity LlmSpend {
+  [Required, Immutable] LlmBudget Budget;
+  [Immutable, MaxLength(200)] string Subject = "";
+  /// The day the period began (UTC): the day itself, the first of the month, or 2000-01-01 for `Total`.
+  [Immutable] DateOnly Period;
+  /// Spent so far, in millionths of a dollar — settled calls only.
+  [ConcurrencyCheck] long SpentMicros = 0;
+  int Calls = 0;
+  int Refused = 0;
+  /// The warning for this period has been raised.
+  bool Warned = false;
+
+  security {
+    allow read when UsesModels || ManagesModelSpend || ReadsModelUsage;
+    allow create, update when UsesModels;
+    deny create except via HoldModelSpend, NoteBudgetRefusal;
+    deny update SpentMicros, Calls, Warned except via SettleModelSpend;
+    deny update Refused except via NoteBudgetRefusal;
+    allow delete when ManagesModelSpend;
+    deny delete except via RemoveBudget, ForgetModelCallRequester;
+  }
+}
+
+/// What the calls that carried a limit of their own for one scope (`LlmCall.Limits`) have spent against it, in one
+/// period. The limit itself is not here: it is whatever each call says, so nothing stored can raise it.
+///
+/// Written only by the call path.
+[Unique(Scope, Window, Period)]
+public entity LlmAllowance {
+  /// The scope as it is recorded on the meter — `task:8f1c…`.
+  [Required, Immutable, MaxLength(300)] string Scope;
+  [Immutable] LlmBudgetWindow Window = LlmBudgetWindow.Total;
+  [Immutable] DateOnly Period;
+  /// Spent so far, in millionths of a dollar — settled calls only.
+  long SpentMicros = 0;
+  int Calls = 0;
+
+  security {
+    allow read when UsesModels || ManagesModelSpend || ReadsModelUsage;
+    allow create, update when UsesModels;
+    deny create except via HoldModelSpend;
+    deny update SpentMicros, Calls except via SettleModelSpend;
+    allow delete when ManagesModelSpend;
+  }
+}
+
+/// Room held for a call that is on its way: counted against its budget until the call reports back, or until the
+/// hold is older than `LlmSetup.HoldFor` — so a call whose process died does not hold a budget's room for ever.
+/// A hold with neither a `Spend` nor an `Allowance` only counts toward its model's `MaxConcurrent`.
+public entity LlmHold {
+  [Required, Immutable, Index] Guid Call;
+  [Immutable] LlmSpend? Spend;
+  [Immutable] LlmAllowance? Allowance;
+  [Required, Immutable, MaxLength(200), Index] string Model;
+  [Immutable] long Micros = 0;
+  [Immutable] DateTime At = DateTime.UtcNow;
+
+  security {
+    allow read, create, delete when UsesModels;
+    deny create except via HoldModelSpend;
+    deny delete except via SettleModelSpend, HoldModelSpend;
+  }
+}
+
+/// The turnstile: reservations and settlements pass it one at a time, each holding it until its own commit, so two
+/// calls reserving at the same moment cannot both take the last of a budget's room — the second reads what the first
+/// left. It holds nothing worth protecting: writing it by hand only waits one's turn.
+public entity LlmTurnstile {
+  [Unique, MaxLength(40)] string Name;
+  long Turn = 0;
+
+  security { allow read, create, update when UsesModels; }
+}
+
+/// A budget has passed its warning share for this period. Raised once per budget, subject and period.
+[Event("Model budget nearly spent")]
+public sealed class LlmBudgetNearlySpent {
+  public string Scope = "";
+  public string Subject = "";
+  public LlmBudgetWindow Window = LlmBudgetWindow.Day;
+  public long SpentMicros = 0;
+  public long LimitMicros = 0;
+}
+
+/// A call was refused because a budget had no room for it.
+[Event("Model budget spent")]
+public sealed class LlmBudgetSpent {
+  public string Scope = "";
+  public string Subject = "";
+  public LlmBudgetWindow Window = LlmBudgetWindow.Day;
+  public long LimitMicros = 0;
+}
+
+// ── setting budgets ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Set the budget for `scope` (and `subject` within it — "" for every subject, each on its own) in `window` to
+/// `limit` US dollars. Setting one that exists changes its limit; what was already spent this period still counts.
+[Server, Authorize(ManagesModelSpend)]
+public void SetBudget(string scope, string subject, LlmBudgetWindow window, decimal limit,
+                      LlmOnLimit onLimit = LlmOnLimit.Stop, decimal warnAt = 0.8m) {
+  if (scope.Trim() == "" || scope.IndexOf(":") >= 0) {
+    throw new ValidationException("A budget's scope is one word — \"app\", \"requester\", \"task\" — without a colon; the subject goes beside it.");
+  }
+  if (limit < 0) { throw new ValidationException("A budget's limit cannot be negative. Set 0 to allow nothing."); }
+  var micros = (long)Math.Round(limit * 1000000m);
+  var budget = LlmBudget.FirstOrDefault(b => b.Scope == scope && b.Subject == subject && b.Window == window);
+  if (budget == null) {
+    new LlmBudget { Scope = scope, Subject = subject, Window = window, LimitMicros = micros, OnLimit = onLimit, WarnAt = warnAt };
+  } else {
+    budget.LimitMicros = micros;
+    budget.OnLimit = onLimit;
+    budget.WarnAt = warnAt;
+  }
+}
+
+/// Remove a budget, and what was counted against it. False when there was none.
+[Server, Authorize(ManagesModelSpend)]
+public bool RemoveBudget(string scope, string subject, LlmBudgetWindow window) {
+  var budget = LlmBudget.FirstOrDefault(b => b.Scope == scope && b.Subject == subject && b.Window == window);
+  if (budget == null) { return false; }
+  foreach (var spend in LlmSpend.Where(s => s.Budget == budget).ToList()) { spend.Delete(); }
+  budget.Delete();
+  return true;
+}
+
+/// What `subject` has spent in `scope` this `window`, in US dollars — settled calls only. 0 when nothing was counted:
+/// spend is counted from the moment a budget covers it.
+public decimal SpentIn(string scope, string subject, LlmBudgetWindow window) {
+  var period = PeriodOf(window, DateTime.UtcNow);
+  decimal micros = 0;
+  foreach (var s in LlmSpend.Where(s => s.Budget.Scope == scope && s.Subject == subject && s.Budget.Window == window && s.Period == period).ToList()) {
+    micros = micros + s.SpentMicros;
+  }
+  return micros / 1000000m;
+}
+
+/// The first day of the period `at` falls in.
+public DateOnly PeriodOf(LlmBudgetWindow window, DateTime at) {
+  if (window == LlmBudgetWindow.Day) { return DateOnly.FromDateTime(at); }
+  if (window == LlmBudgetWindow.Month) { return new DateOnly(at.Year, at.Month, 1); }
+  return new DateOnly(2000, 1, 1);
+}
+
+// ── reserving ───────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Why a reservation was refused.
+public enum LlmHoldRefusal { None, OverBudget, Busy }
+
+/// What a reservation answered.
+public class LlmHoldResult {
+  public LlmHoldRefusal Refusal = LlmHoldRefusal.None;
+  /// Something was held and must be settled. False when the call falls under no budget and its model has no cap:
+  /// there was nothing to hold, and there is nothing to settle.
+  public bool Held = false;
+  /// The sentence to show, when refused.
+  public string Why = "";
+  /// The budget that refused, and what is left of it.
+  public string Scope = "";
+  public string Subject = "";
+  public LlmBudgetWindow Window = LlmBudgetWindow.Day;
+  public long LeftMicros = 0;
+  /// The refusing budget (or the call) says to step down to a cheaper model rather than stop.
+  public bool StepDown = false;
+  /// The refusing budget's row and the period it refused in — what `NoteBudgetRefusal` counts against.
+  public Guid? Budget;
+  public DateOnly Period;
+}
+
+/// One budget a call falls under, with the subject it is counted for.
+class LlmBudgetFor {
+  public LlmBudget Budget;
+  public string Subject = "";
+}
+
+/// Wait this call's turn at the turnstile, and hold it until this unit of work commits. One statement: the database
+/// queues the callers, so nobody retries.
+void PassTurnstile() {
+  var passed = LlmTurnstile.Where(t => t.Name == "spend").Update(t => { t.Turn = t.Turn + 1; });
+  if (passed > 0) { return; }
+  // The very first call of an app builds the turnstile; two that race to are settled by its declared [Unique].
+  try {
+    new LlmTurnstile { Name = "spend" };
+    UnitOfWork.Commit();
+  } catch (ValidationException e) {
+    UnitOfWork.Discard();
+  }
+  LlmTurnstile.Where(t => t.Name == "spend").Update(t => { t.Turn = t.Turn + 1; });
+}
+
+/// The budgets a call's scopes fall under, in one read: for each scope and window, the budget naming its subject, else
+/// the one for every subject of its kind.
+List<LlmBudgetFor> BudgetsOf(List<string> scopes) {
+  List<LlmBudgetFor> answer = [];
+  List<string> kinds = [];
+  foreach (var line in scopes) {
+    var kind = line.Substring(0, line.IndexOf(":"));
+    if (!kinds.Contains(kind)) { kinds.Add(kind); }
+  }
+  var rows = LlmBudget.Where(b => kinds.Contains(b.Scope)).ToList();
+  if (rows.Count == 0) { return answer; }
+  foreach (var line in scopes) {
+    var colon = line.IndexOf(":");
+    var kind = line.Substring(0, colon);
+    var subject = line.Substring(colon + 1);
+    foreach (var b in rows) {
+      if (b.Scope != kind) { continue; }
+      if (b.Subject == subject) { answer.Add(new LlmBudgetFor { Budget = b, Subject = subject }); continue; }
+      if (b.Subject != "") { continue; }
+      // The budget for every subject of this kind — unless one names this subject for the same window.
+      var named = false;
+      foreach (var other in rows) {
+        if (other.Scope == kind && other.Window == b.Window && other.Subject == subject && subject != "") { named = true; }
+      }
+      if (!named) { answer.Add(new LlmBudgetFor { Budget = b, Subject = subject }); }
+    }
+  }
+  return answer;
+}
+
+/// ⭐ RESERVE ROOM FOR ONE CALL, atomically: `micros` against every budget the call's scopes fall under, and a place
+/// among the model's concurrent calls when it caps them. All of it or none of it — and committed at once, in a unit
+/// of work of its own, so the next caller sees it before this call has left.
+///
+/// Reservations pass a turnstile one at a time: a call that arrives while another is reserving waits for that one's
+/// commit and then reads the room it left. A call that falls under no budget, to a model with no cap, holds nothing
+/// and waits for nobody.
+[Server, Authorize(UsesModels), OwnUnitOfWork]
+internal LlmHoldResult HoldModelSpend(Guid call, string model, int maxConcurrent, long micros, List<string> scopes,
+                                      LlmOnLimit? onLimit, List<LlmLimit> limits) {
+  var budgets = BudgetsOf(scopes);
+  if (budgets.Count == 0 && maxConcurrent == 0 && limits.Count == 0) { return new LlmHoldResult(); }
+
+  PassTurnstile();
+  var now = DateTime.UtcNow;
+  var live = now - App.Setting<LlmSetup>().HoldFor;
+  // A hold nobody came back for — its process died mid-call — is released here, by whoever reserves next.
+  foreach (var stale in LlmHold.Where(h => h.At < live).Take(50).ToList()) { stale.Delete(); }
+
+  if (maxConcurrent > 0) {
+    var serving = LlmHold.Where(h => h.Model == model && h.Spend == null && h.Allowance == null && h.At >= live).Count();
+    if (serving >= maxConcurrent) {
+      UnitOfWork.Discard();
+      return new LlmHoldResult { Refusal = LlmHoldRefusal.Busy,
+        Why = $"'{model}' is already serving the {maxConcurrent} calls it allows at once." };
+    }
+    new LlmHold { Call = call, Model = model, Micros = 0, At = now };
+  }
+
+  foreach (var b in budgets) {
+    var budget = b.Budget;
+    var period = PeriodOf(budget.Window, now);
+    var spend = LlmSpend.FirstOrDefault(s => s.Budget == budget && s.Subject == b.Subject && s.Period == period);
+    long held = 0;
+    if (spend == null) {
+      spend = new LlmSpend { Budget = budget, Subject = b.Subject, Period = period };
+    } else {
+      foreach (var h in LlmHold.Where(h => h.Spend == spend && h.At >= live).ToList()) { held = held + h.Micros; }
+    }
+    var left = budget.LimitMicros - spend.SpentMicros - held;
+    if (micros > left) {
+      // Nothing of this reservation stands.
+      var refused = new LlmHoldResult {
+        Budget = budget.Id, Period = period,
+        Refusal = LlmHoldRefusal.OverBudget, Scope = budget.Scope, Subject = b.Subject, Window = budget.Window,
+        LeftMicros = left < 0 ? 0 : left, StepDown = (onLimit ?? budget.OnLimit) == LlmOnLimit.StepDown,
+        Why = BudgetSentence(budget.Scope, b.Subject, budget.Window, budget.LimitMicros),
+      };
+      UnitOfWork.Discard();
+      return refused;
+    }
+    new LlmHold { Call = call, Spend = spend, Model = model, Micros = micros, At = now };
+  }
+
+  // The limits the call carries for itself: the same reservation, against what the calls that carried the same
+  // limit have spent. The limit is read from THIS call, so nothing a stored row says can widen it.
+  foreach (var limit in limits) {
+    var scope = ScopeLine(limit.Scope);
+    if (scope == "") { continue; }
+    var period = PeriodOf(limit.Window, now);
+    var allowance = LlmAllowance.FirstOrDefault(a => a.Scope == scope && a.Window == limit.Window && a.Period == period);
+    long held = 0;
+    if (allowance == null) {
+      allowance = new LlmAllowance { Scope = scope, Window = limit.Window, Period = period };
+    } else {
+      foreach (var h in LlmHold.Where(h => h.Allowance == allowance && h.At >= live).ToList()) { held = held + h.Micros; }
+    }
+    var left = limit.LimitMicros - allowance.SpentMicros - held;
+    if (micros > left) {
+      var colon = scope.IndexOf(":");
+      var refused = new LlmHoldResult {
+        Refusal = LlmHoldRefusal.OverBudget, Scope = scope.Substring(0, colon), Subject = scope.Substring(colon + 1),
+        Window = limit.Window, LeftMicros = left < 0 ? 0 : left, Period = period,
+        StepDown = (onLimit ?? limit.OnLimit) == LlmOnLimit.StepDown,
+        Why = LimitSentence(scope, limit.Window, limit.LimitMicros),
+      };
+      UnitOfWork.Discard();
+      return refused;
+    }
+    new LlmHold { Call = call, Allowance = allowance, Model = model, Micros = micros, At = now };
+  }
+  return new LlmHoldResult { Held = true };
+}
+
+string LimitSentence(string scope, LlmBudgetWindow window, long limitMicros) {
+  var per = window == LlmBudgetWindow.Day ? " for today" : window == LlmBudgetWindow.Month ? " for this month" : "";
+  return $"There is no room left in the limit set for {scope}{per} (${Dollars(limitMicros)}). Nothing was sent.";
+}
+
+/// What the calls that carried a limit for `scope` have spent against it this `window`, in US dollars — settled calls
+/// only. `SpentAgainst("task:" + task.Id)` is what a piece of work has used of its own limit.
+public decimal SpentAgainst(string scope, LlmBudgetWindow window = LlmBudgetWindow.Total) {
+  var line = ScopeLine(scope);
+  var period = PeriodOf(window, DateTime.UtcNow);
+  // Summed where it is stored, never read as a row: a call settles in a unit of work of its own, and a row this
+  // unit of work had already read would go on answering the figure from before the call.
+  var micros = LlmAllowance.Where(a => a.Scope == line && a.Window == window && a.Period == period).Sum(a => a.SpentMicros);
+  return micros / 1000000m;
+}
+
+string BudgetSentence(string scope, string subject, LlmBudgetWindow window, long limitMicros) {
+  var whose = subject == "" ? $"the {scope} budget" : $"the {scope} budget for {subject}";
+  var per = window == LlmBudgetWindow.Day ? " for today" : window == LlmBudgetWindow.Month ? " for this month" : "";
+  return $"There is no room left in {whose}{per} (limit ${Dollars(limitMicros)}). Nothing was sent.";
+}
+
+/// Millionths of a dollar as dollars, to the cent or — below a cent — to four places.
+public string Dollars(long micros) {
+  var d = micros / 1000000m;
+  return micros != 0 && micros < 10000 ? d.ToString("0.0000") : d.ToString("0.00");
+}
+
+/// Count one refusal against a budget's period, and tell whoever listens that it is spent.
+[Server, Authorize(UsesModels), OwnUnitOfWork]
+internal void NoteBudgetRefusal(Guid budgetId, string subject, DateOnly period) {
+  var budget = LlmBudget.FirstOrDefault(b => b.Id == budgetId);
+  if (budget == null) { return; }
+  PassTurnstile();
+  var spend = LlmSpend.FirstOrDefault(s => s.Budget == budget && s.Subject == subject && s.Period == period);
+  if (spend == null) { spend = new LlmSpend { Budget = budget, Subject = subject, Period = period }; }
+  spend.Refused = spend.Refused + 1;
+  Raise(new LlmBudgetSpent { Scope = budget.Scope, Subject = subject, Window = budget.Window, LimitMicros = budget.LimitMicros });
+}
+
+/// ⭐ SETTLE ONE CALL: release what was held for it and count what it actually cost — against the same budgets, in
+/// one commit of its own. A failed call settles at 0.
+[Server, Authorize(UsesModels), OwnUnitOfWork]
+internal void SettleModelSpend(Guid call, long micros) {
+  PassTurnstile();
+  foreach (var hold in LlmHold.Where(h => h.Call == call).ToList()) {
+    var spend = hold.Spend;
+    if (spend != null) {
+      var budget = spend.Budget;
+      spend.SpentMicros = spend.SpentMicros + micros;
+      spend.Calls = spend.Calls + 1;
+      if (!spend.Warned && budget.WarnAt > 0 && spend.SpentMicros >= budget.LimitMicros * budget.WarnAt) {
+        spend.Warned = true;
+        Raise(new LlmBudgetNearlySpent {
+          Scope = budget.Scope, Subject = spend.Subject, Window = budget.Window,
+          SpentMicros = spend.SpentMicros, LimitMicros = budget.LimitMicros,
+        });
+      }
+    }
+    var allowance = hold.Allowance;
+    if (allowance != null) {
+      allowance.SpentMicros = allowance.SpentMicros + micros;
+      allowance.Calls = allowance.Calls + 1;
+    }
+    hold.Delete();
+  }
+}

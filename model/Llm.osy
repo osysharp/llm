@@ -1,0 +1,134 @@
+// `Llm.` — the calls an app writes.
+namespace Osysharp.Llm;
+
+/// A typed decision: the value, and how sure the model is of it.
+public class Decision<T> {
+  /// What was decided.
+  public T Value;
+  /// How sure the model is, 0 to 1.
+  public decimal Confidence = 0;
+  /// Whether `Confidence` is calibrated (a model built for decisions) or the model's own estimate of itself (a chat
+  /// model asked to decide). Compare an uncalibrated one only with others from the same model.
+  public bool Calibrated = false;
+  /// The alternatives the model weighed, most likely first, when it reports them — each as JSON of the decided type.
+  public List<LlmDecisionChoice> Alternatives = [];
+  /// The model that decided, by the app's name, and what the decision cost in millionths of a US dollar.
+  public string Model = "";
+  public long CostMicros = 0;
+
+  /// Sure enough to act on without a person: `Confidence` is at least `threshold`.
+  public bool IsAtLeast(decimal threshold) { return Confidence >= threshold; }
+}
+
+/// ⭐ CALLING A MODEL. Every call here is routed by the app's router, held to its budgets, and metered.
+///
+///     var answer  = await Llm.Complete("Summarise this in a sentence: " + text);
+///     var invoice = await Llm.Extract<Invoice>(scan);
+///     var triage  = await Llm.Decide<Urgency>(message);
+///
+/// Each answers a task, as any call that waits on somebody else does. `await` it where you make it for the plain
+/// call; keep the task (`var a = Llm.Complete(…); var b = Llm.Complete(…);`) to have two in flight and await both.
+public class Llm {
+  /// A model's answer to one prompt, as text.
+  public static async Task<string> Complete(string prompt) {
+    return CompleteWith(RequestOf(prompt), new LlmCall()).Text();
+  }
+
+  /// The same, asking for one of the app's models by its name. Naming a model the app's routing does not admit for
+  /// this call is refused (`LlmRouteDenied`), never quietly served by another.
+  public static async Task<string> Complete(string prompt, string model) {
+    return CompleteWith(RequestOf(prompt), new LlmCall { Model = model }).Text();
+  }
+
+  /// A model's answer to one prompt, with what the call is said in full — its scopes, its limits, its purpose — for a
+  /// plain call that is charged to something: `await Llm.Complete(prompt, new LlmCall { Scopes = ["case:" + c.Id] })`.
+  public static async Task<LlmResult> Complete(string prompt, LlmCall call) {
+    return CompleteWith(RequestOf(prompt), call);
+  }
+
+  /// One call, with everything said: the whole request, and what the call is — its kind, its scopes, its limits.
+  /// Answers the response with the model that served it and what it cost.
+  public static async Task<LlmResult> Complete(LlmRequest request, LlmCall call) {
+    return CompleteWith(request, call);
+  }
+
+  /// A model's answer to one prompt, as it is written — for an answer somebody is watching arrive.
+  public static stream<LlmStreamEvent> Stream(string prompt) {
+    foreach (var e in StreamWith(RequestOf(prompt), new LlmCall())) { yield return e; }
+  }
+
+  /// One streamed call, with everything said.
+  public static stream<LlmStreamEvent> Stream(LlmRequest request, LlmCall call) {
+    foreach (var e in StreamWith(request, call)) { yield return e; }
+  }
+
+  /// ⭐ A TYPED VALUE read out of text: the model is held to `T`'s own schema, and its answer is read as a `T`.
+  ///
+  ///     class Invoice { public string Supplier = ""; public decimal Total; public DateOnly? Due; }
+  ///     var invoice = await Llm.Extract<Invoice>(scannedText);
+  ///
+  /// `instructions` says what to look for when the type's own names and comments do not. An answer that is not a
+  /// document of the shape is sent back to the model once; a second miss is `LlmAnswerUnreadable`.
+  public static async Task<T> Extract<T>(string text, string instructions = "") {
+    return JsonSerializer.Deserialize<T>(ExtractJson(text, instructions, Json.SchemaOf<T>(), new LlmCall { Kind = LlmTaskKind.Extract }));
+  }
+
+  /// The same, with the call said in full — a model, scopes, a ceiling.
+  public static async Task<T> Extract<T>(string text, string instructions, LlmCall call) {
+    return JsonSerializer.Deserialize<T>(ExtractJson(text, instructions, Json.SchemaOf<T>(), call));
+  }
+
+  /// ⭐ A FILE a model is asked to READ — a picture (`image/png`, `image/jpeg`, `image/webp`, `image/gif`) or a PDF
+  /// (`application/pdf`), as its bytes. What `Extract<T>(file, …)` reads, and a block a request may carry:
+  ///
+  ///     var receipt = await Llm.Extract<ReceiptFields>(Llm.FileBlock(asset.MimeType, File.ReadAllBytes(asset)));
+  ///
+  /// Any other kind of file is refused here, before anything is sent: no provider reads it.
+  public static LlmContentBlock FileBlock(string mediaType, byte[] bytes) {
+    var type = mediaType.Trim().ToLower();
+    if (type == "application/pdf") {
+      return new LlmContentBlock { Kind = LlmBlockKind.Document, MediaType = type, DataBase64 = Convert.ToBase64String(bytes) };
+    }
+    if (type == "image/png" || type == "image/jpeg" || type == "image/webp" || type == "image/gif") {
+      return new LlmContentBlock { Kind = LlmBlockKind.Image, MediaType = type, DataBase64 = Convert.ToBase64String(bytes) };
+    }
+    throw new ArgumentException($"A model reads a picture (PNG, JPEG, WebP, GIF) or a PDF, and this file is '{mediaType}'.");
+  }
+
+  /// ⭐ A TYPED VALUE read out of a FILE — a receipt photographed, an invoice as a PDF (`FileBlock`). The same as
+  /// reading text: held to `T`'s schema, sent back once when the answer is not the shape.
+  public static async Task<T> Extract<T>(LlmContentBlock file, string instructions = "") {
+    return JsonSerializer.Deserialize<T>(ExtractJsonFromFile(file, instructions, Json.SchemaOf<T>(), new LlmCall { Kind = LlmTaskKind.Extract }));
+  }
+
+  /// The same, with the call said in full — a model, scopes, a ceiling.
+  public static async Task<T> Extract<T>(LlmContentBlock file, string instructions, LlmCall call) {
+    return JsonSerializer.Deserialize<T>(ExtractJsonFromFile(file, instructions, Json.SchemaOf<T>(), call));
+  }
+
+  /// ⭐ A TYPED DECISION: `input` in, a `T` out — an enum to choose among, a number to score, a record to fill — with
+  /// how sure the model is. A model built for decisions serves it when the app has one; any chat model can.
+  ///
+  ///     enum Urgency { Low, Normal, High }
+  ///     var d = await Llm.Decide<Urgency>(message.Body, "How urgent is this for the customer?");
+  ///     if (d.Value == Urgency.High && d.IsAtLeast(0.8m)) { Escalate(message); }
+  public static async Task<Decision<T>> Decide<T>(string input, string question = "") {
+    var made = DecideWith(new LlmDecisionRequest { Question = question, Input = input, SchemaJson = Json.SchemaOf<T>() },
+                          new LlmCall { Kind = LlmTaskKind.Decide });
+    return new Decision<T> {
+      Value = JsonSerializer.Deserialize<T>(made.Decision.ValueJson), Confidence = made.Decision.Confidence,
+      Calibrated = made.Decision.Calibrated, Alternatives = made.Decision.Alternatives, Model = made.Model,
+      CostMicros = made.CostMicros,
+    };
+  }
+
+  /// The same, with the call said in full.
+  public static async Task<Decision<T>> Decide<T>(string input, string question, LlmCall call) {
+    var made = DecideWith(new LlmDecisionRequest { Question = question, Input = input, SchemaJson = Json.SchemaOf<T>() }, call);
+    return new Decision<T> {
+      Value = JsonSerializer.Deserialize<T>(made.Decision.ValueJson), Confidence = made.Decision.Confidence,
+      Calibrated = made.Decision.Calibrated, Alternatives = made.Decision.Alternatives, Model = made.Model,
+      CostMicros = made.CostMicros,
+    };
+  }
+}

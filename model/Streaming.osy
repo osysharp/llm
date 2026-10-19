@@ -1,0 +1,93 @@
+// A streamed call — the same road as `CompleteWith`, with the answer handed on as it arrives.
+namespace Osysharp.Llm;
+
+/// ⭐ ONE STREAMED CALL: switched, routed, reserved and metered exactly as `CompleteWith` is. The events are the
+/// provider's own, passed on as they arrive; the last one (`MessageComplete`) carries the counts the meter prices.
+///
+/// A candidate whose provider fails before it has sent anything is passed over for the router's next one, as a
+/// plain call's is. Once an answer has begun it is that model's: a failure part-way is recorded and raised — the
+/// reader has already seen the start of this answer, and another model would begin a different one.
+///
+/// `Llm.Stream(request, call)` is this function.
+public stream<LlmStreamEvent> StreamWith(LlmRequest request, LlmCall call) {
+  RequireGeneration();
+  var walk = new LlmWalk { Call = Guid.NewGuid() };
+  var maxOut = request.MaxTokens ?? 0;
+  var facts = FactsOf(request, call, maxOut);
+  // Somebody is reading it as it arrives.
+  facts.LatencySensitivity = LlmLatencySensitivity.Interactive;
+  var route = RouteOrRefuse(facts);
+  var served = false;
+  var index = 0;
+  while (index < route.Ordered.Count && !served) {
+    var name = route.Ordered[index];
+    index = index + 1;
+    if (walk.Tried.Contains(name)) { continue; }
+    walk.Tried.Add(name);
+    var model = ModelNamed(name);
+    if (!model.Chats()) { continue; }
+
+    var admission = Admit(walk, ModelCallKind.Stream, name, model, facts, route, call, maxOut > 0 ? maxOut : model.MaxOutputTokens);
+    if (admission.Refused.Refusal == LlmHoldRefusal.OverBudget) {
+      route = StepDownOrStop(walk, admission.Refused, facts);
+      index = 0;
+      continue;
+    }
+    if (!admission.Proceed) { continue; }
+
+    var started = DateTime.UtcNow;
+    var began = false;
+    var complete = false;
+    var inputTokens = 0;
+    var outputTokens = 0;
+    var cacheRead = 0;
+    var cacheWrite = 0;
+    LlmStreamEvent? closing = null;
+    request.Model = model.ProviderModel();
+    try {
+      foreach (var e in StreamOf(model, name, request)) {
+        began = true;
+        if (e.Kind == LlmStreamEventKind.MessageComplete) {
+          complete = true;
+          inputTokens = e.InputTokens;
+          outputTokens = e.OutputTokens;
+          cacheRead = e.CacheReadTokens;
+          cacheWrite = e.CacheCreationTokens;
+          // Held until the call is on the meter, so it can say what the call cost.
+          closing = e;
+        } else {
+          yield return e;
+        }
+      }
+      served = true;
+    } catch (ExternalServiceException e) {
+      Failed(walk, admission, started, e.Message);
+      if (began) { throw; }
+    } catch (Exception e) {
+      Failed(walk, admission, started, e.Message);
+      throw;
+    }
+    if (served) {
+      var cost = Served(admission, inputTokens, outputTokens, cacheRead, cacheWrite, started,
+        complete ? null : "The stream ended without its closing event, so it reported no usage.");
+      if (closing != null) {
+        closing!.Model = name;
+        closing!.RouteRule = route.RuleId;
+        closing!.Call = walk.Call;
+        closing!.CostMicros = cost;
+        yield return closing!;
+      }
+    }
+  }
+  if (!served) { NoneServed(walk); }
+}
+
+/// What one model streams for `request`: its provider, or the script in a test that scripts every model
+/// (`EveryModelIsScripted`).
+stream<LlmStreamEvent> StreamOf(LlmModel model, string name, LlmRequest request) {
+  if (EveryModelIsScripted()) {
+    foreach (var e in new ScriptedModel { Name = name }.Stream(request)) { yield return e; }
+  } else {
+    foreach (var e in model.Client!.Stream(request)) { yield return e; }
+  }
+}

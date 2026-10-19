@@ -1,0 +1,102 @@
+// A scripted model — a provider whose answers a test writes, so an app's model calls are tested without a model.
+namespace Osysharp.Llm;
+
+/// ⭐ A MODEL FOR TESTS. Name it where a real provider would go, and answer for it from the test:
+///
+///     // the test app's setup
+///     app.Llm = new LlmSetup { Models = [ new LlmModel { Name = "Fast", Client = new ScriptedModel { Name = "Fast" }, Model = "scripted-fast" } ] };
+///
+///     // a test
+///     ScriptedAnswer.Stub((model, request) => Scripted.Text("A short summary."));
+///     Assert.Equal("A short summary.", Summarise(article));
+///
+/// Everything around the provider is real — the router, the budgets, the meter — so a test reads what a call cost
+/// from the meter rows, exactly as the app will. An answer's token counts are whatever the script says they were.
+public class ScriptedModel : ILlmClient, IDecisionModel {
+  /// The name `ScriptedAnswer` is asked under — the model's own name, by convention.
+  public string Name = "";
+
+  internal LlmResponse Complete(LlmRequest request) { return ScriptedAnswer(Name, request); }
+
+  /// The scripted answer, a text block at a time, then the closing event with its counts.
+  internal stream<LlmStreamEvent> Stream(LlmRequest request) {
+    var answer = ScriptedAnswer(Name, request);
+    foreach (var block in answer.Content) {
+      if (block.Kind == LlmBlockKind.Text) {
+        yield return new LlmStreamEvent { Kind = LlmStreamEventKind.TextDelta, Delta = block.Text ?? "" };
+      } else if (block.Kind == LlmBlockKind.ToolUse) {
+        yield return new LlmStreamEvent { Kind = LlmStreamEventKind.ToolUseStart, ToolUseId = block.ToolUseId, ToolName = block.ToolName };
+        yield return new LlmStreamEvent { Kind = LlmStreamEventKind.ToolInputDelta, ToolUseId = block.ToolUseId, InputDelta = block.InputJson ?? "{}" };
+        yield return new LlmStreamEvent { Kind = LlmStreamEventKind.ToolUseEnd, ToolUseId = block.ToolUseId };
+      }
+    }
+    yield return new LlmStreamEvent {
+      Kind = LlmStreamEventKind.MessageComplete, StopReason = answer.StopReason, InputTokens = answer.InputTokens,
+      OutputTokens = answer.OutputTokens, CacheCreationTokens = answer.CacheCreationTokens, CacheReadTokens = answer.CacheReadTokens,
+    };
+  }
+
+  internal LlmDecision Decide(LlmDecisionRequest request) { return ScriptedDecision(Name, request); }
+}
+
+/// ⭐ WHETHER EVERY MODEL OF THE APP IS SERVED BY THE SCRIPT — false, until a test says so. An app whose `app.Llm` names
+/// a real provider (`Client = new AnthropicClient { ApiKey = Secret.Anthropic }`) tests its model calls the way a test
+/// app does, without a key and without the network:
+///
+///     EveryModelIsScripted.Stub(() => true);
+///     ScriptedAnswer.Stub((model, request) => Scripted.Text("A short summary."));
+///
+/// Each model is then answered by `ScriptedAnswer` (and `ScriptedDecision`) under its own `Name`, in place of its
+/// `Client` (and `Decider`); everything around the provider stays real — the router, the budgets, the meter at the
+/// app's own prices. Outside a test nothing can answer it but `false`: a stub is a test's alone.
+public bool EveryModelIsScripted() { return false; }
+
+/// What the scripted model named `model` answers to `request`. A test says: `ScriptedAnswer.Stub((model, request) =>
+/// Scripted.Text("…"));` — and may throw an `ExternalServiceException` from it to play a provider that is down.
+/// Unscripted, it fails the way a provider does, so a test that forgot to answer is told so.
+public LlmResponse ScriptedAnswer(string model, LlmRequest request) {
+  throw new ExternalServiceException($"No answer is scripted for the model '{model}'. In the test, before the call: "
+    + "`ScriptedAnswer.Stub((model, request) => Scripted.Text(\"…\"));`");
+}
+
+/// What the scripted decision model named `model` decides for `request`. A test says:
+/// `ScriptedDecision.Stub((model, request) => Scripted.Decision("\"High\"", 0.93m));`.
+public LlmDecision ScriptedDecision(string model, LlmDecisionRequest request) {
+  throw new ExternalServiceException($"No decision is scripted for the model '{model}'. In the test, before the call: "
+    + "`ScriptedDecision.Stub((model, request) => Scripted.Decision(\"\\\"High\\\"\", 0.9m));`");
+}
+
+/// Answers for a scripted model to give.
+public class Scripted {
+  /// A text answer that used `inputTokens` of prompt and `outputTokens` of answer.
+  public static LlmResponse Text(string text, int inputTokens = 100, int outputTokens = 20) {
+    return new LlmResponse {
+      Content = [ new LlmContentBlock { Kind = LlmBlockKind.Text, Text = text } ],
+      StopReason = LlmStopReason.EndTurn, InputTokens = inputTokens, OutputTokens = outputTokens,
+    };
+  }
+
+  /// The model asking for one tool to be run, with these arguments as JSON.
+  public static LlmResponse ToolUse(string tool, string inputJson, string id = "call-1", int inputTokens = 100, int outputTokens = 20) {
+    return new LlmResponse {
+      Content = [ new LlmContentBlock { Kind = LlmBlockKind.ToolUse, ToolUseId = id, ToolName = tool, InputJson = inputJson } ],
+      StopReason = LlmStopReason.ToolUse, InputTokens = inputTokens, OutputTokens = outputTokens,
+    };
+  }
+
+  /// A decision: the value as JSON of the decided type (`"\"High\""`, `"0.4"`, `"{…}"`), with a calibrated confidence.
+  public static LlmDecision Decision(string valueJson, decimal confidence, int inputTokens = 100) {
+    return new LlmDecision { ValueJson = valueJson, Confidence = confidence, Calibrated = true, InputTokens = inputTokens };
+  }
+
+  /// The text of the last user message of a request — what a script usually answers from.
+  public static string Asked(LlmRequest request) {
+    var text = "";
+    foreach (var m in request.Messages) {
+      if (m.Role != "user") { continue; }
+      text = "";
+      foreach (var b in m.Content) { if (b.Kind == LlmBlockKind.Text) { text = text + (b.Text ?? ""); } }
+    }
+    return text;
+  }
+}

@@ -1,0 +1,84 @@
+// Osysharp.Llm — taking a person off the meter: who a call was made for goes; what it cost stays counted.
+//
+// The numbers. A scripted answer of 1000 tokens in and 200 out on the cheap model costs 2000 millionths of a dollar.
+using Osysharp.Llm;
+using SeedBank;
+
+[Test(Bank)]
+void a_person_is_taken_off_the_meter_and_what_their_calls_cost_stays_counted() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("A line.", 1000, 200));
+  runas (Tove) {
+    SetBudget("requester", "", LlmBudgetWindow.Day, 1m);
+    SetBudget("requester", Omar.Id.ToString(), LlmBudgetWindow.Month, 2m);
+    SetBudget("app", "", LlmBudgetWindow.Day, 1m);
+    UnitOfWork.Commit();
+  }
+  runas (Omar) { Summarise("beans"); Summarise("beans"); }
+  runas (Ines) { Summarise("beans"); }
+  Background.Settle();
+
+  var omar = Omar.Id;
+  var ines = Ines.Id;
+  runas (Tove) {
+    Assert.Equal(2, ModelCall.Count(c => c.Requester == omar));
+    Assert.Contains("requester:" + omar.ToString(), ModelCall.First(c => c.Requester == omar).Scopes);
+    Assert.False(ModelCallsInFlightFor(omar));
+
+    Assert.Equal(2, ForgetModelCallRequester(omar));
+    UnitOfWork.Commit();
+
+    // No row is his any more, and none names him in what it was charged to.
+    Assert.Equal(0, ModelCall.Count(c => c.Requester == omar));
+    Assert.Equal(0, ModelCall.Count(c => c.Scopes.Contains(omar.ToString())));
+    // What was counted against budgets of his own is gone, and so is the budget that named him.
+    Assert.Equal(0, LlmSpend.Count(s => s.Subject == omar.ToString()));
+    Assert.Equal(0, LlmBudget.Count(b => b.Subject == omar.ToString()));
+    // The calls are still on the meter — three rows, six thousand millionths — and still counted for the app.
+    Assert.Equal(3, ModelCall.Count());
+    Assert.Equal(0.006m, SpentOn("app:"));
+    Assert.Equal(0.006m, SpentIn("app", "", LlmBudgetWindow.Day));
+    // Ines is untouched: her row, her scope, her allowance.
+    Assert.Equal(1, ModelCall.Count(c => c.Requester == ines));
+    Assert.Equal(0.002m, SpentIn("requester", ines.ToString(), LlmBudgetWindow.Day));
+    // The budget for every person still stands.
+    Assert.Equal(1, LlmBudget.Count(b => b.Scope == "requester" && b.Subject == ""));
+  }
+}
+
+[Test(Bank)]
+void only_whoever_manages_spend_takes_a_person_off_the_meter_and_only_through_the_kit() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("A line.", 1000, 200));
+  runas (Omar) { Summarise("beans"); }
+  Background.Settle();
+  var omar = Omar.Id;
+  // A curator reads the meter and changes nothing on it; Omar himself does not either.
+  runas (Ines) { Assert.Denied(() => ForgetModelCallRequester(omar)); }
+  runas (Omar) { Assert.Denied(() => ForgetModelCallRequester(omar)); }
+  runas (Tove) {
+    // The treasurer may — through the kit, and no other way: a row rewritten by hand is refused.
+    Assert.Denied(() => { RewriteWhoAsked(ModelCall.Single(c => c.Requester == omar)); UnitOfWork.Commit(); });
+    UnitOfWork.Discard();
+    Assert.Equal(1, ModelCall.Count(c => c.Requester == omar));
+    // Positive control: the same treasurer, through the kit.
+    Assert.Equal(1, ForgetModelCallRequester(omar));
+    UnitOfWork.Commit();
+    Assert.Equal(0, ModelCall.Count(c => c.Requester == omar));
+  }
+}
+
+[Test(Bank)]
+void taking_a_person_off_only_what_is_old_leaves_their_recent_calls_theirs() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("A line.", 1000, 200));
+  TestClock.Set(new DateTime(2026, 3, 2, 10, 0, 0));
+  runas (Omar) { Summarise("beans"); }
+  TestClock.Set(new DateTime(2026, 6, 2, 10, 0, 0));
+  runas (Omar) { Summarise("beans"); }
+  Background.Settle();
+  var omar = Omar.Id;
+  runas (Tove) {
+    Assert.Equal(1, ForgetModelCallRequester(omar, new DateTime(2026, 5, 1)));
+    UnitOfWork.Commit();
+    Assert.Equal(1, ModelCall.Count(c => c.Requester == omar));
+    Assert.Equal(2, ModelCall.Count());
+  }
+}
