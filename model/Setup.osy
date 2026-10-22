@@ -8,6 +8,13 @@ virtual policy UsesModels => true;
 /// `policy ReadsModelUsage => IsFinance;`.
 virtual policy ReadsModelUsage => false;
 
+/// Who reads the calls charged to particular scopes — a call at a time, by what it is charged to (`ModelCall.Scopes`,
+/// one scope a line). It is the answer for an app of many tenants, where `ReadsModelUsage` — one answer for the
+/// whole app — would show one organisation what another's calls cost:
+/// `policy ReadsModelUsageOf(string scopes) => Report.Any(r => scopes.Contains("report:" + r.Id.ToString()) && …);`.
+/// Nobody, until the app says.
+virtual policy ReadsModelUsageOf(string scopes) => false;
+
 /// Who sets prices and budgets. Nobody, until the app says: `policy ManagesModelSpend => IsAdmin;`.
 virtual policy ManagesModelSpend => false;
 

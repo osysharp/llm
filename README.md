@@ -9,7 +9,7 @@ priced from your own price book, in millionths of a dollar.
 
 ```osy
 use Osysharp.Llm@2;
-use Osysharp.Models.Anthropic@0 { egress "api.anthropic.com"; }
+use Osysharp.Models.Anthropic@1 { egress "api.anthropic.com"; }
 
 app.Secrets = [ new Secret("Anthropic") ];
 

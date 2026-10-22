@@ -42,8 +42,9 @@ public entity LlmSpend {
   [Immutable, MaxLength(200)] string Subject = "";
   /// The day the period began (UTC): the day itself, the first of the month, or 2000-01-01 for `Total`.
   [Immutable] DateOnly Period;
-  /// Spent so far, in millionths of a dollar — settled calls only.
-  [ConcurrencyCheck] long SpentMicros = 0;
+  /// Spent so far, in millionths of a dollar — settled calls only. Moved only by `+=` in `SettleModelSpend`, which is
+  /// one statement relative to the stored row, so two settles each add their share (osy docs entity-atomic-updates).
+  long SpentMicros = 0;
   int Calls = 0;
   int Refused = 0;
   /// The warning for this period has been raised.
@@ -389,8 +390,8 @@ internal void SettleModelSpend(Guid call, long micros) {
     var spend = hold.Spend;
     if (spend != null) {
       var budget = spend.Budget;
-      spend.SpentMicros = spend.SpentMicros + micros;
-      spend.Calls = spend.Calls + 1;
+      spend.SpentMicros += micros;
+      spend.Calls += 1;
       if (!spend.Warned && budget.WarnAt > 0 && spend.SpentMicros >= budget.LimitMicros * budget.WarnAt) {
         spend.Warned = true;
         Raise(new LlmBudgetNearlySpent {
@@ -401,8 +402,8 @@ internal void SettleModelSpend(Guid call, long micros) {
     }
     var allowance = hold.Allowance;
     if (allowance != null) {
-      allowance.SpentMicros = allowance.SpentMicros + micros;
-      allowance.Calls = allowance.Calls + 1;
+      allowance.SpentMicros += micros;
+      allowance.Calls += 1;
     }
     hold.Delete();
   }

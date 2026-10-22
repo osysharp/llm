@@ -393,8 +393,9 @@ long Served(LlmAdmission admission, int inputTokens, int outputTokens, int cache
             DateTime started, string? note) {
   var cost = CostMicros(admission.Price, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens);
   if (admission.Held) { SettleModelSpend(admission.Opening.Call, cost); }
-  // The host's own count of AI work across everything it serves — a measurement, bounded by nothing.
-  Ai.CountGeneration(inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens);
+  // The host's own count of AI work across everything it serves — the tokens and what they cost, which is what the
+  // console's usage page shows an application's owner. A measurement, bounded by nothing.
+  Ai.CountGeneration(inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens, cost);
   RecordModelCall(admission.Opening, ModelCallOutcome.Served, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens,
     cost, MillisSince(started), note);
   return cost;

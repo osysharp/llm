@@ -269,6 +269,35 @@ void a_meter_row_is_written_only_by_the_call_path_and_never_changed() {
   }
 }
 
+/// The bank, and two stewards — each looking after one lot.
+[TestFixture]
+void Stewards() {
+  Bank();
+  new Keeper { Name = "Sami", Steward = "A1" };
+  new Keeper { Name = "Pia", Steward = "B2" };
+}
+
+[Test(Stewards)]
+void a_call_is_read_by_whoever_reads_what_it_is_charged_to_and_nobody_else() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("A line.", 100, 20));
+  runas (Omar) {
+    SummariseFor("A1", "Early dwarf beans.");
+    SummariseFor("B2", "Late runner beans.");
+    SummariseFor("B2", "Late runner beans, again.");
+  }
+  runas (Ines) { Assert.Equal(3, ModelCall.Count()); }
+  // Each steward reads the calls charged to their own lot, and only those; Omar, who made them, reads none.
+  runas (Keeper.Single(k => k.Name == "Sami")) {
+    Assert.Equal(1, ModelCall.Count());
+    Assert.Contains("lot:A1", ModelCall.Single().Scopes);
+  }
+  runas (Keeper.Single(k => k.Name == "Pia")) {
+    Assert.Equal(2, ModelCall.Count());
+    Assert.Equal(0, ModelCall.Count(c => c.Scopes.Contains("lot:A1")));
+  }
+  runas (Omar) { Assert.Equal(0, ModelCall.Count()); }
+}
+
 // ── the price book ──────────────────────────────────────────────────────────────────────────────────────────────────
 
 [Test(Bank)]

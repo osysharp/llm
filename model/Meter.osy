@@ -68,6 +68,11 @@ public entity ModelCall {
     // Whoever manages spend reads the rows too: they are who deletes old ones and takes a person off them, and a row
     // nobody may read is a row nobody can find.
     allow read when ReadsModelUsage || ManagesModelSpend;
+    // SECURITY-INVARIANT(llm-a-call-is-read-by-what-it-is-charged-to): a reader the app admits by `ReadsModelUsageOf`
+    // reads a call only when the app's answer for THAT call's own scopes says so — never every call. Failure mode: one
+    // tenant reads what another's calls were for and cost. Guarded by tests/calls.test.osy
+    // `a_call_is_read_by_whoever_reads_what_it_is_charged_to_and_nobody_else`.
+    allow read when IsAuthenticated where ReadsModelUsageOf(Scopes);
     allow create when UsesModels;
     deny create except via RecordModelCall;
     // SECURITY-INVARIANT(a-meter-row-changes-only-by-losing-who-it-was-for): every other member is immutable, and

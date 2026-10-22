@@ -11,12 +11,16 @@ using Osysharp.Llm;
   bool Treasurer = false;
   /// Kept away from the models altogether.
   bool Barred = false;
+  /// The one lot a steward looks after — whose calls, and only those, they read (`ReadsModelUsageOf`).
+  [MaxLength(40)] string Steward = "";
   security { allow read when IsAuthenticated || IsAnonymous; }
 }
 
 policy UsesModels        => !Keeper.Any(k => k == user && k.Barred);
 policy ReadsModelUsage   => Keeper.Any(k => k == user && (k.Curator || k.Treasurer));
 policy ManagesModelSpend => Keeper.Any(k => k == user && k.Treasurer);
+/// A steward reads the calls charged to their own lot.
+policy ReadsModelUsageOf(string scopes) => Keeper.Any(k => k == user && k.Steward != "" && scopes.Contains("lot:" + k.Steward));
 
 /// A lot of seed as it arrived, with the grower's note.
 entity SeedLot {
