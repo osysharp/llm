@@ -21,7 +21,7 @@
 //
 // It asks for nothing: no host, no secret. The provider kits ask for theirs.
 package Osysharp.Llm {
-  version     "2.5.0";
+  version     "2.6.0";
   minPlatform "0.17.0";
   summary     "calling a model: the provider and router contracts, the call path (route, reserve, call, fall back, meter), a price book and budgets with hard limits, typed extraction and typed decisions, and a scripted model for tests.";
 
