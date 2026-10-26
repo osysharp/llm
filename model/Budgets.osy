@@ -264,7 +264,7 @@ List<LlmBudgetFor> BudgetsOf(List<string> scopes) {
 /// Reservations pass a turnstile one at a time: a call that arrives while another is reserving waits for that one's
 /// commit and then reads the room it left. A call that falls under no budget, to a model with no cap, holds nothing
 /// and waits for nobody.
-[Server, Authorize(UsesModels), OwnUnitOfWork]
+[Server, Authorize(UsesModels), CommitsAlone]
 internal LlmHoldResult HoldModelSpend(Guid call, string model, int maxConcurrent, long micros, List<string> scopes,
                                       LlmOnLimit? onLimit, List<LlmLimit> limits) {
   var budgets = BudgetsOf(scopes);
@@ -370,7 +370,7 @@ public string Dollars(long micros) {
 }
 
 /// Count one refusal against a budget's period, and tell whoever listens that it is spent.
-[Server, Authorize(UsesModels), OwnUnitOfWork]
+[Server, Authorize(UsesModels), CommitsAlone]
 internal void NoteBudgetRefusal(Guid budgetId, string subject, DateOnly period) {
   var budget = LlmBudget.FirstOrDefault(b => b.Id == budgetId);
   if (budget == null) { return; }
@@ -383,7 +383,7 @@ internal void NoteBudgetRefusal(Guid budgetId, string subject, DateOnly period) 
 
 /// ⭐ SETTLE ONE CALL: release what was held for it and count what it actually cost — against the same budgets, in
 /// one commit of its own. A failed call settles at 0.
-[Server, Authorize(UsesModels), OwnUnitOfWork]
+[Server, Authorize(UsesModels), CommitsAlone]
 internal void SettleModelSpend(Guid call, long micros) {
   PassTurnstile();
   foreach (var hold in LlmHold.Where(h => h.Call == call).ToList()) {

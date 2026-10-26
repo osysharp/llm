@@ -137,7 +137,7 @@ public class ModelCallOpening {
 
 /// ⭐ WRITE ONE METER ROW — in a unit of work of its own, so the row for an attempt that failed is still there after
 /// the call it belonged to has failed, and a call made in the middle of other work commits none of that work.
-[Server, Authorize(UsesModels), OwnUnitOfWork]
+[Server, Authorize(UsesModels), CommitsAlone]
 internal void RecordModelCall(ModelCallOpening opening, ModelCallOutcome outcome, int inputTokens, int outputTokens,
                               int cacheReadTokens, int cacheWriteTokens, long costMicros, int durationMs, string? problem) {
   var price = opening.PriceRow == null ? null : ModelPrice.FirstOrDefault(p => p.Id == opening.PriceRow);
