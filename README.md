@@ -249,3 +249,96 @@ osy test kits/llm/tests
   `Streaming.osy`, `Structured.osy` (extract, decide), `Budgets.osy`, `Meter.osy` (the meter and the price book),
   `Llm.osy` (the calls an app writes), `Scripted.osy` (the scripted model)
 - Uses nothing but the language: no host, no secret. The provider packages ask for theirs.
+
+## Examples
+
+Taken from this package's own tests, which compile and run on every release.
+
+```osy
+using Osysharp.Llm;
+using SeedBank;
+
+[Test(Bank)]
+void a_call_whose_provider_failed_gives_its_room_back() {
+  ScriptedAnswer.Stub((model, request) => {
+    if (Heard.Count(h => h.What == "fail") > 0) { throw new ExternalServiceException(model + " is down"); }
+    return Scripted.Text("A line.", 1000, 200);
+  });
+  runas (Tove) { SetBudget("app", "", LlmBudgetWindow.Day, 0.2m); UnitOfWork.Commit(); }
+  runas (Ines) {
+    new Heard { What = "fail" };
+    UnitOfWork.Commit();
+    Assert.Throws<ExternalServiceException>(() => Summarise("beans"));
+    // Two attempts, both failed: nothing spent, nothing still held.
+    Assert.Equal(0, LlmSpend.Single().SpentMicros);
+    Assert.Equal(0, LlmHold.Count());
+  }
+}
+```
+
+From [`tests/budgets.test.osy`](tests/budgets.test.osy).
+
+```osy
+using Osysharp.Llm;
+using SeedBank;
+
+[Test(Bank)]
+[runas(Ines)]
+void a_call_is_served_by_the_routers_first_model_and_metered_at_its_price() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("Early beans, saved in 2024.", 1000, 200));
+  Assert.Equal("Early beans, saved in 2024.", Summarise("Early dwarf beans, saved from the 2024 crop, dry stored."));
+
+  var row = ModelCall.Single();
+  Assert.Equal("Small", row.Model);
+  Assert.Equal("scripted-small", row.ProviderModel);
+  Assert.Equal(ModelCallKind.Complete, row.Kind);
+  Assert.Equal(ModelCallOutcome.Served, row.Outcome);
+  Assert.Equal(1000, row.InputTokens);
+  Assert.Equal(200, row.OutputTokens);
+  // 1000 tokens at $1 a million and 200 at $5: 1000 + 1000 millionths of a dollar.
+  Assert.Equal(2000, row.CostMicros);
+  Assert.Equal("seed-bank:1", row.RouteRule);
+  Assert.Equal(Ines.Id, row.Requester);
+}
+```
+
+From [`tests/calls.test.osy`](tests/calls.test.osy).
+
+```osy
+using Osysharp.Llm;
+using SeedBank;
+
+[Test(Bank)]
+void only_whoever_manages_spend_takes_a_person_off_the_meter_and_only_through_the_kit() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("A line.", 1000, 200));
+  runas (Omar) { Summarise("beans"); }
+  Background.Settle();
+  var omar = Omar.Id;
+  // A curator reads the meter and changes nothing on it; Omar himself does not either.
+  runas (Ines) { Assert.Denied(() => ForgetModelCallRequester(omar)); }
+  runas (Omar) { Assert.Denied(() => ForgetModelCallRequester(omar)); }
+  runas (Tove) {
+    // The treasurer may — through the kit, and no other way: a row rewritten by hand is refused.
+    Assert.Denied(() => { RewriteWhoAsked(ModelCall.Single(c => c.Requester == omar)); UnitOfWork.Commit(); });
+    UnitOfWork.Discard();
+    Assert.Equal(1, ModelCall.Count(c => c.Requester == omar));
+    // Positive control: the same treasurer, through the kit.
+    Assert.Equal(1, ForgetModelCallRequester(omar));
+    UnitOfWork.Commit();
+    Assert.Equal(0, ModelCall.Count(c => c.Requester == omar));
+  }
+}
+```
+
+From [`tests/forget.test.osy`](tests/forget.test.osy).
+
+## Learn more
+
+- [The Osysharp.Llm reference](https://osysharp.com/reference/agent/kit-llm/)
+- [Osysharp.Llm in the package catalogue](https://osysharp.com/packages/#osysharp-llm)
+- [The Osy# reference](https://osysharp.com/reference/) — the language, the runtime and every kit
+- [`llms-full.txt`](https://osysharp.com/llms-full.txt) — the whole reference and specification as one Markdown file, for a coding agent
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE).
