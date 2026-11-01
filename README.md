@@ -214,7 +214,7 @@ Each of these is a test in the kit's test app:
 | Budgets are set only by who manages the spend, through `SetBudget` | `budgets_are_set_only_by_who_manages_the_spend_and_only_through_the_kit` |
 | Prices are set only by who manages the spend, through `SetModelPrice` | `prices_are_set_only_by_who_manages_the_spend_and_only_through_the_kit` |
 | A call is refused before anything is sent when its budget has no room | `a_call_that_does_not_fit_its_budget_is_refused_before_anything_is_sent` |
-| Twelve calls at once take exactly what fits | `a_budget_reserves_atomically_under_parallel_calls` |
+| Calls racing for one budget take exactly what fits | `a_budget_reserves_atomically_under_parallel_calls` |
 | A limit a call carries is held the same way, and binds only the calls that carry it | `a_limit_a_call_carries_is_reserved_against_before_the_call_leaves`, `a_limit_binds_only_the_calls_that_carry_it` |
 | What a limit has counted is changed only by the call path | `what_a_limit_has_counted_is_changed_only_by_the_call_path` |
 | A provider is called only by the kit's call path — an app or another package calling one directly does not compile | `AProviderIsCalledOnlyByTheLlmKitTests` (the platform's own tests) |

@@ -208,8 +208,8 @@ void a_call_may_carry_a_ceiling_of_its_own() {
 
 [Test(Bank)]
 void a_budget_reserves_atomically_under_parallel_calls() {
-  // Twelve calls at once against two cents. Each reserves 5012 and — the script says — costs 5000; the hashing keeps
-  // each call in flight long enough for the others to arrive. Three fit (15036 held); a fourth never does, in any
+  // Twelve calls, four at a time, against two cents. Each reserves 5012 and — the script says — costs 5000; the hashing
+  // keeps each call in flight long enough for the others to arrive, so four race for three places. Three fit (15036 held); a fourth never does, in any
   // order: 15000 spent + 5012 is still more than 20000.
   ScriptedAnswer.Stub((model, request) => { Security.HashPassword("a model that takes its time"); return Scripted.Text("A line.", 0, 1000); });
   runas (Tove) { SetBudget("app", "", LlmBudgetWindow.Day, 0.02m); UnitOfWork.Commit(); }
@@ -226,7 +226,7 @@ void a_budget_reserves_atomically_under_parallel_calls() {
 
 [Test(Bank)]
 void a_model_serves_only_as_many_calls_at_once_as_it_allows() {
-  // Eight calls at once to the model that takes two at a time; the router puts the small one behind it.
+  // Eight calls, four at a time, to the model that takes two at a time; the router puts the small one behind it.
   ScriptedAnswer.Stub((model, request) => { Security.HashPassword("a model that takes its time"); return Scripted.Text("from " + model); });
   runas (Ines) {
     SummariseAllNarrowly(["a", "b", "c", "d", "e", "f", "g", "h"]);
@@ -302,7 +302,7 @@ void what_a_limit_has_spent_is_the_figure_now_when_asked_twice_around_a_call() {
 [Test(Bank)]
 [runas(Ines)]
 void a_declared_limit_reserves_atomically_under_parallel_calls() {
-  // Twelve calls at once against two cents for one lot: three fit (15036 held), a fourth never does.
+  // Twelve calls, four at a time, against two cents for one lot: three fit (15036 held), a fourth never does.
   ScriptedAnswer.Stub((model, request) => { Security.HashPassword("a model that takes its time"); return Scripted.Text("A line.", 0, 1000); });
   SummariseAllWithin("A1", 20000, ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"]);
   Assert.Equal(3, ModelCall.Count(c => c.Outcome == ModelCallOutcome.Served));

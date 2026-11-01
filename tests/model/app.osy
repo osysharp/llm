@@ -161,21 +161,28 @@ LlmStreamEvent ClosingOf(string prompt) {
   return closing;
 }
 
+/// How many calls a test runs at once: more than a budget has room for, so they race for it, and few enough that every
+/// call's connections fit an app's pool. A call in flight holds two: its task's, and the one its reservation commits on. Run
+/// with one body per core, a dozen calls took the pool's six between them and waited on each other until it timed out.
+ParallelOptions AtOnce() {
+  return new ParallelOptions { MaxDegreeOfParallelism = 4 };
+}
+
 /// Many notes summarised at once — each call a task of its own.
 void SummariseAll(List<string> notes) {
-  Parallel.ForEach(notes, note => { Summarise(note); });
+  Parallel.ForEach(notes, AtOnce(), note => { Summarise(note); });
 }
 
 /// The same, and a call the budget has no room for is simply not served.
 void SummariseAllThatFit(List<string> notes) {
-  Parallel.ForEach(notes, note => {
+  Parallel.ForEach(notes, AtOnce(), note => {
     try { Summarise(note); } catch (LlmBudgetExceeded e) { }
   });
 }
 
 /// Many calls at once to the model that takes two at a time.
 void SummariseAllNarrowly(List<string> notes) {
-  Parallel.ForEach(notes, note => { SummariseWith("Narrow", note); });
+  Parallel.ForEach(notes, AtOnce(), note => { SummariseWith("Narrow", note); });
 }
 
 /// A line for one lot, held to a limit the bank puts on that lot's calls: at most `limitMicros` in all.
@@ -187,7 +194,7 @@ string SummariseWithin(string lotCode, long limitMicros, string note) {
 
 /// Many lines for one lot at once, each held to the same limit; a call the limit has no room for is not served.
 void SummariseAllWithin(string lotCode, long limitMicros, List<string> notes) {
-  Parallel.ForEach(notes, note => {
+  Parallel.ForEach(notes, AtOnce(), note => {
     try { SummariseWithin(lotCode, limitMicros, note); } catch (LlmBudgetExceeded e) { }
   });
 }
