@@ -402,3 +402,89 @@ void a_refused_call_inside_an_action_tells_the_actions_caller_why() {
     Assert.Throws<LlmBudgetExceeded>(() => Summarise("beans"));
   }
 }
+
+/// ⭐ A CALL MADE SOMEWHERE ELSE COUNTS AGAINST THE BUDGETS IT FALLS UNDER, AFTER THE FACT. One key's budget — a cent a
+/// month, charged to as `lot:A1` by the app's own calls and by the host's sessions on that key alike. A session last
+/// month counts against last month. One an hour ago takes this month past its limit: it is recorded all the same (it
+/// has already happened) and its row says so, and the app's next call on the key finds no room and is refused. The
+/// budget says how much of its use came from outside. Already over, the next session is still recorded.
+[Test(Bank)]
+void an_outside_call_counts_against_the_keys_budget_and_the_next_call_is_refused_when_over() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("A line.", 1000, 200));
+  runas (Tove) { SetBudget("lot", "A1", LlmBudgetWindow.Month, 0.01m); UnitOfWork.Commit(); }
+  runas (Ines) { SummariseFor("A1", "beans"); }                      // 2000 counted: the next one would fit
+  runas (Tove) {
+    RecordOutsideModelCall(new OutsideModelCall {
+      Model = "Small", Cost = 0.5m, Account = "host-2 / Max B", At = DateTime.UtcNow.AddMonths(-1), Scopes = ["lot:A1"],
+    });
+    UnitOfWork.Commit();
+    Assert.Equal(0.002m, SpentIn("lot", "A1", LlmBudgetWindow.Month));
+
+    var late = RecordOutsideModelCall(new OutsideModelCall {
+      Model = "Small", Cost = 0.009m, Account = "host-2 / Max B", At = DateTime.UtcNow.AddMinutes(-1), Scopes = ["lot:A1"],
+    });
+    UnitOfWork.Commit();
+    var row = ModelCall.Single(c => c.Call == late);
+    Assert.Equal(ModelCallOutcome.Served, row.Outcome);
+    Assert.Contains("It took the lot budget for A1 for the month from", row.Problem!);
+    Assert.Contains("past its limit ($0.01): counted all the same", row.Problem!);
+    Assert.Equal(0.011m, SpentIn("lot", "A1", LlmBudgetWindow.Month));
+    Assert.Equal(0.009m, SpentFromOutsideIn("lot", "A1", LlmBudgetWindow.Month));
+    Assert.Equal(0, LlmHold.Count());
+  }
+  runas (Ines) {
+    var refused = Assert.Throws<LlmBudgetExceeded>(() => SummariseFor("A1", "beans"));
+    Assert.Equal("lot", refused.Scope);
+    Assert.Equal("A1", refused.Subject);
+    Assert.Equal(0, refused.LeftMicros);
+  }
+  runas (Tove) {
+    RecordOutsideModelCall(new OutsideModelCall { Model = "Small", Cost = 0.001m, Scopes = ["lot:A1"] });
+    UnitOfWork.Commit();
+    Assert.Equal(0.012m, SpentIn("lot", "A1", LlmBudgetWindow.Month));
+    Assert.Equal(0.010m, SpentFromOutsideIn("lot", "A1", LlmBudgetWindow.Month));
+  }
+}
+
+// ── a key's budget ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// ⭐ ONE BUDGET HOLDS A KEY'S CALLS, WHEREVER THEY WERE MADE. A cent a month on the seed fund's key: a call the bank
+/// makes on it, and a session a host ran on the same key and the treasurer recorded by its account, fill it with
+/// nothing else named — and the next call on the key finds no room. A call on another key is not held by it.
+[Test(Bank)]
+void a_budget_on_a_key_holds_its_calls_made_here_and_recorded_from_elsewhere() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("A line.", 1000, 200));
+  runas (Tove) { SetBudget("key", "fund", LlmBudgetWindow.Month, 0.01m); UnitOfWork.Commit(); }
+  runas (Ines) { SummariseOnKey("fund", "beans"); }                       // 2000 counted
+  runas (Tove) {
+    var outside = RecordOutsideModelCall(new OutsideModelCall { Model = "Small", Cost = 0.008m, Account = "fund", Purpose = "Build: lot A1" });
+    UnitOfWork.Commit();
+    Assert.Contains("key:fund", ModelCall.Single(c => c.Call == outside).Scopes);
+    Assert.Equal(0.01m, SpentIn("key", "fund", LlmBudgetWindow.Month));
+    Assert.Equal(0.008m, SpentFromOutsideIn("key", "fund", LlmBudgetWindow.Month));
+  }
+  runas (Ines) {
+    var refused = Assert.Throws<LlmBudgetExceeded>(() => SummariseOnKey("fund", "beans"));
+    Assert.Equal("key", refused.Scope);
+    Assert.Equal("fund", refused.Subject);
+    Assert.Equal("A line.", SummariseOnKey("members", "beans").Text());
+    Assert.Equal(0, LlmHold.Count());
+  }
+}
+
+/// A key serves only as many calls at once as it allows. Eight calls at once on the members' key, which takes one at
+/// a time and serves the small model alone: a call that finds it full has nowhere on its key to go, and is refused as
+/// busy — never moved to another key.
+[Test(Bank)]
+void a_key_at_its_concurrent_cap_refuses_the_call_and_never_moves_it_to_another_key() {
+  ScriptedAnswer.Stub((model, request) => { Security.HashPassword("a key that takes its time"); return Scripted.Text("from " + model); });
+  runas (Ines) {
+    SummariseAllOnKey("members", ["a", "b", "c", "d", "e", "f", "g", "h"]);
+    Assert.True(ModelCall.Count(c => c.Outcome == ModelCallOutcome.Served) >= 1);
+    Assert.True(ModelCall.Count(c => c.Outcome == ModelCallOutcome.Busy) >= 1);
+    Assert.Equal("The key 'members' is already serving the 1 calls it allows at once.",
+                 ModelCall.First(c => c.Outcome == ModelCallOutcome.Busy).Problem);
+    Assert.Equal(8, ModelCall.Count(c => c.Account == "members"));
+    Assert.Equal(0, LlmHold.Count());
+  }
+}

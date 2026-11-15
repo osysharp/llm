@@ -3,7 +3,14 @@
 namespace Osysharp.Llm;
 
 /// How a call reached the model.
-public enum ModelCallKind { Complete, Stream, Decide }
+public enum ModelCallKind {
+  Complete,
+  Stream,
+  Decide,
+  /// Made somewhere else — a host's session, another system on its own key — and recorded here, as it was measured
+  /// there (`RecordOutsideModelCall`). Nothing of this app routed, held or sent it.
+  Outside,
+}
 
 /// How one attempt ended.
 public enum ModelCallOutcome {
@@ -20,8 +27,9 @@ public enum ModelCallOutcome {
 /// ⭐ ONE ATTEMPT TO CALL A MODEL. A call that fell back twice is three rows, sharing `Call`.
 ///
 /// A row is written once, when the attempt is over, and never changed — except that who it was for can be taken
-/// off it (`ForgetModelCallRequester`). It is written only by this package's own call path: the app, a page, an
-/// import and another package can read what the app's policy lets them read, and can write nothing.
+/// off it (`ForgetModelCallRequester`). It is written only by this package's own call path, and for a call made
+/// somewhere else by `RecordOutsideModelCall`: the app, a page, an import and another package can read what the app's
+/// policy lets them read, and can write nothing.
 public entity ModelCall {
   /// The call this attempt belongs to — every attempt of one `Llm.Complete` shares it.
   [Required, Immutable, Index] Guid Call;
@@ -48,6 +56,10 @@ public entity ModelCall {
   [MaxLength(2000)] string Scopes = "";
   /// What the call was for, in the caller's words. Never the prompt.
   [Immutable, MaxLength(200)] string Purpose = "";
+  /// ⭐ THE KEY IT RAN ON, by the app's id for it — never the key itself: the app's own call on a key (`LlmCall.Key`),
+  /// or the key or account a call made elsewhere ran on (`OutsideModelCall.Account`). A call with one is also charged to
+  /// `key:<Account>`, so one budget holds a key's calls from here and from elsewhere. "": a model's own client.
+  [Immutable, MaxLength(200), Index] string Account = "";
 
   /// The provider's own counts.
   [Immutable] int InputTokens = 0;
@@ -61,7 +73,8 @@ public entity ModelCall {
   /// What was held against the budgets before the provider was called.
   [Immutable] long ReservedMicros = 0;
   [Immutable] int DurationMs = 0;
-  /// What the provider said when it failed, or which budget refused.
+  /// What the provider said when it failed, or which budget refused — or, for a call made somewhere else, which budgets
+  /// it took past their limit when it was counted.
   [Immutable, MaxLength(2000)] string? Problem;
 
   security {
@@ -133,6 +146,9 @@ public class ModelCallOpening {
   public string Purpose = "";
   public Guid? PriceRow;
   public long ReservedMicros = 0;
+  /// When it was made — null: now, as the attempt ends; and the account it ran on (`ModelCall.Account`).
+  public DateTime? At;
+  public string Account = "";
 }
 
 /// ⭐ WRITE ONE METER ROW — in a unit of work of its own, so the row for an attempt that failed is still there after
@@ -142,15 +158,118 @@ internal void RecordModelCall(ModelCallOpening opening, ModelCallOutcome outcome
                               int cacheReadTokens, int cacheWriteTokens, long costMicros, int durationMs, string? problem) {
   var price = opening.PriceRow == null ? null : ModelPrice.FirstOrDefault(p => p.Id == opening.PriceRow);
   new ModelCall {
-    Call = opening.Call, Attempt = opening.Attempt, Kind = opening.Kind, Outcome = outcome,
+    Call = opening.Call, Attempt = opening.Attempt, At = opening.At ?? DateTime.UtcNow, Kind = opening.Kind, Outcome = outcome,
     Model = opening.Model, ProviderModel = opening.ProviderModel, FallbackFrom = opening.FallbackFrom,
-    RouteRule = opening.RouteRule, Facts = opening.FactsJson, Rejected = opening.RejectedJson,
-    Requester = opening.Requester, Scopes = opening.Scopes, Purpose = Clip(opening.Purpose, 200),
+    RouteRule = opening.RouteRule, Facts = opening.FactsJson == "" ? null : opening.FactsJson,
+    Rejected = opening.RejectedJson == "" ? null : opening.RejectedJson,
+    Requester = opening.Requester, Scopes = opening.Scopes, Purpose = Clip(opening.Purpose, 200), Account = opening.Account,
     InputTokens = inputTokens, OutputTokens = outputTokens, CacheReadTokens = cacheReadTokens,
     CacheWriteTokens = cacheWriteTokens, CostMicros = costMicros, Price = price,
     ReservedMicros = opening.ReservedMicros, DurationMs = durationMs,
     Problem = problem == null ? null : Clip(problem!, 2000),
   };
+}
+
+/// A model call made somewhere else, as it was measured there — what `RecordOutsideModelCall` takes.
+///
+///     RecordOutsideModelCall(new OutsideModelCall {
+///       Model = "claude-opus-5-5", InputTokens = 41200, OutputTokens = 3900, CacheReadTokens = 380000,
+///       Cost = 1.42m, Account = "host-2 / Max B", At = startedAt, Purpose = "Build: nightly report",
+///       Scopes = ["product:" + p.Id, "task:" + task.Id],
+///     });
+public class OutsideModelCall {
+  /// The model, by the app's name for it when it has one, else the provider's id; and the provider's id ("": the same).
+  public string Model = "";
+  public string ProviderModel = "";
+  /// The provider's own counts.
+  public int InputTokens = 0;
+  public int OutputTokens = 0;
+  public int CacheReadTokens = 0;
+  public int CacheWriteTokens = 0;
+  /// What it cost, in US dollars, as measured where it ran. Null: priced here, from the price book in force `At`.
+  public decimal? Cost;
+  /// The key or account it ran on, by the app's id for it — never the key itself. The call is charged to `key:<Account>`
+  /// with nothing named, as the app's own calls on that key are (`LlmCall.Key`).
+  public string Account = "";
+  /// When it was made. Null: now.
+  public DateTime? At;
+  /// What it was for, in the caller's words — never the prompt — and how long it took.
+  public string Purpose = "";
+  public int DurationMs = 0;
+  /// What it is charged to besides the app and the model: each a `kind:subject` — `"product:" + p.Id`.
+  public List<string> Scopes = [];
+}
+
+/// The kinds of scope the meter names itself on every call, and no caller may.
+List<string> MeterScopeKinds() { return ["app:", "requester:", "model:", "key:"]; }
+
+/// ⭐ RECORD A MODEL CALL MADE SOMEWHERE ELSE — a host's agent session, another system on a key of its own — on this
+/// app's meter, as it was measured there: one `ModelCall` row (`Kind` = `Outside`) beside the app's own calls, so
+/// `SpentOn(scope)`, every report that reads the meter and whoever reads by scope (`ReadsModelUsageOf`) see the spend
+/// together. Answers the row's `Call`.
+///
+/// ⭐ IT COUNTS AGAINST THE BUDGETS, AFTER THE FACT. What it cost is counted against every budget an ordinary call
+///   charged to the same scopes falls under — `app`, the recorder as `requester`, its `model`, and each scope named —
+///   in the period it RAN in, by the same settle as the app's own calls (`SettleModelSpend`). Nothing is held for it
+///   and it is never refused: it has already happened. When it takes a budget past its limit the row says so
+///   (`Problem`), and the app's next call against that budget is refused like any over-spent one. `OutsideMicros` on
+///   `LlmSpend`, and `SpentFromOutsideIn`, say how much of a budget's use came from outside. A call recorded with an
+///   `Account` is charged to `key:<Account>` — the scope the app's own calls on that key (`LlmCall.Key`) are charged to —
+///   so one budget on the key (`SetBudget("key", id, …)`) holds both, with nothing named.
+///
+/// ⚑ A RECORD, NOT A CALL. Nothing here routed or sent it, and it is not in the host's own count of the app's AI use.
+///
+/// Whoever `RecordsModelCalls` admits — whoever manages model spend, until the app says — and the app's own code.
+// SECURITY-INVARIANT(llm-a-call-made-elsewhere-is-recorded-only-by-whom-the-app-names): a meter row for a call this
+// app did not make is written only here, by whoever `RecordsModelCalls` admits (whoever manages model spend, until the
+// app says) or the app's own code — never by whoever may merely call a model — with the meter's own scopes (`app:`,
+// `requester:`, `model:`, `key:`) set here and refused from the caller, and `Kind` = `Outside` so it is never taken for a
+// call the app made. Failure mode: anybody who uses models puts spend on another tenant's scope, or a forged row reads
+// as the app's own routed call, or uses up another tenant's budget. Guarded by tests/calls.test.osy
+// `a_call_made_somewhere_else_is_recorded_on_the_meter_as_it_was_measured_there`.
+[Server, Authorize(RecordsModelCalls)]
+public Guid RecordOutsideModelCall(OutsideModelCall call) {
+  var model = call.Model.Trim();
+  if (model == "") { throw new ValidationException("Name the model the call was made on."); }
+  if (model.Length > 200 || call.ProviderModel.Length > 200) { throw new ValidationException("A model's name is at most 200 characters."); }
+  if (call.InputTokens < 0 || call.OutputTokens < 0 || call.CacheReadTokens < 0 || call.CacheWriteTokens < 0 || call.DurationMs < 0) {
+    throw new ValidationException("A call's counts are never below 0.");
+  }
+  if (call.Cost != null && call.Cost! < 0) { throw new ValidationException("A call costs 0 or more."); }
+  if (call.Account.Length > 200) { throw new ValidationException("An account is named in at most 200 characters."); }
+  var at = call.At ?? DateTime.UtcNow;
+  if (at > DateTime.UtcNow.AddMinutes(5)) { throw new ValidationException("A call is recorded once it has been made: this one is in the future."); }
+  List<string> scopes = ["app:"];
+  var who = CurrentRequester();
+  if (who != null) { scopes.Add("requester:" + who!.ToString()); }
+  scopes.Add("model:" + model);
+  var account = call.Account.Trim();
+  if (account.Contains("\n")) { throw new ValidationException("An account is named on one line."); }
+  if (account != "") { scopes.Add("key:" + account); }
+  foreach (var named in call.Scopes) {
+    var scope = ScopeLine(named);
+    if (scope == "" || scope.Contains("\n") || scope.StartsWith(":")) { throw new ValidationException("A call is charged to a kind and a subject: `\"product:\" + p.Id`."); }
+    foreach (var kind in MeterScopeKinds()) {
+      if (scope.StartsWith(kind)) { throw new ValidationException($"`{kind}` is the meter's own: it names it on every call itself."); }
+    }
+    if (!scopes.Contains(scope)) { scopes.Add(scope); }
+  }
+  var lines = string.Join("\n", scopes);
+  if (lines.Length > 2000) { throw new ValidationException($"A call is charged to at most 2000 characters of scopes, and these are {lines.Length}."); }
+  var price = PriceAt(model, at);
+  var cost = call.Cost == null
+    ? CostMicros(price, call.InputTokens, call.OutputTokens, call.CacheReadTokens, call.CacheWriteTokens)
+    : (long)Math.Ceiling(call.Cost! * 1000000m);
+  var id = Guid.NewGuid();
+  // Counted as the app's own calls are, by the one settle: nothing held, the period it ran in, never refused.
+  var over = SettleModelSpend(id, cost, scopes, at);
+  RecordModelCall(new ModelCallOpening {
+    Call = id, Kind = ModelCallKind.Outside, Model = model, ProviderModel = call.ProviderModel.Trim() == "" ? model : call.ProviderModel.Trim(),
+    Requester = who, Scopes = lines, Purpose = call.Purpose, PriceRow = call.Cost == null ? price.Row : null,
+    At = at, Account = account,
+  }, ModelCallOutcome.Served, call.InputTokens, call.OutputTokens, call.CacheReadTokens, call.CacheWriteTokens, cost, call.DurationMs,
+    over == "" ? null : over);
+  return id;
 }
 
 string Clip(string text, int max) { return text.Length <= max ? text : text.Substring(0, max); }

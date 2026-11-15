@@ -269,6 +269,54 @@ void a_meter_row_is_written_only_by_the_call_path_and_never_changed() {
   }
 }
 
+/// ⭐ A CALL MADE SOMEWHERE ELSE SITS ON THE METER WITH THE APP'S OWN. A host ran two calls on keys of its own; the
+/// treasurer records them as they were measured there. One says what it cost, and keeps that figure; the other does
+/// not, and is priced from the price book as it stood when it was made. Both are on the meter — what they were charged
+/// to, on which account, when — and `SpentOn` counts them. Nobody else records one; the meter's own scopes are its own,
+/// and a call is recorded once it has been made.
+[Test(Bank)]
+void a_call_made_somewhere_else_is_recorded_on_the_meter_as_it_was_measured_there() {
+  var yesterday = DateTime.UtcNow.AddDays(-1);
+  runas (Tove) {
+    var measured = RecordOutsideModelCall(new OutsideModelCall {
+      Model = "claude-opus-5-5", InputTokens = 41200, OutputTokens = 3900, CacheReadTokens = 380000, Cost = 1.42m,
+      Account = "host-2 / Max B", At = yesterday, Purpose = "Build: lot A1", Scopes = ["lot:A1", " lot:A1 "], DurationMs = 61000,
+    });
+    var priced = RecordOutsideModelCall(new OutsideModelCall { Model = "Small", InputTokens = 1000, OutputTokens = 200, Account = "host-2 / Max B" });
+    UnitOfWork.Commit();
+
+    var row = ModelCall.Single(c => c.Call == measured);
+    Assert.Equal(ModelCallKind.Outside, row.Kind);
+    Assert.Equal(ModelCallOutcome.Served, row.Outcome);
+    Assert.Equal("claude-opus-5-5", row.Model);
+    Assert.Equal(41200, row.InputTokens);
+    Assert.Equal(3900, row.OutputTokens);
+    Assert.Equal(380000, row.CacheReadTokens);
+    Assert.Equal(1420000, row.CostMicros);
+    Assert.Null(row.Price);
+    Assert.Equal("host-2 / Max B", row.Account);
+    Assert.Equal(yesterday, row.At);
+    Assert.Equal(61000, row.DurationMs);
+    Assert.Equal("Build: lot A1", row.Purpose);
+    // Charged to the key it ran on, by its account, with nothing named.
+    Assert.Equal("app:\nrequester:" + Tove.Id.ToString() + "\nmodel:claude-opus-5-5\nkey:host-2 / Max B\nlot:A1", row.Scopes);
+    // The declared price of Small — $1 and $5 a million — as it stood when the call was made.
+    Assert.Equal(2000, ModelCall.Single(c => c.Call == priced).CostMicros);
+    Assert.Equal(1.42m, SpentOn("lot:A1"));
+    Assert.Equal(1.422m, SpentOn("app:"));
+
+    Assert.Throws<ValidationException>(() => RecordOutsideModelCall(new OutsideModelCall { Model = "Small", Scopes = ["model:Large"] }));
+    // A key is named by the account the call ran on, never as a scope of its own.
+    Assert.Throws<ValidationException>(() => RecordOutsideModelCall(new OutsideModelCall { Model = "Small", Scopes = ["key:team-b"] }));
+    Assert.Throws<ValidationException>(() => RecordOutsideModelCall(new OutsideModelCall { Model = "Small", Scopes = ["requester:" + Omar.Id.ToString()] }));
+    Assert.Throws<ValidationException>(() => RecordOutsideModelCall(new OutsideModelCall { Model = "Small", At = DateTime.UtcNow.AddDays(1) }));
+    Assert.Throws<ValidationException>(() => RecordOutsideModelCall(new OutsideModelCall { Model = " " }));
+  }
+  runas (Ines) { Assert.Throws<NotAuthorized>(() => RecordOutsideModelCall(new OutsideModelCall { Model = "Small", Cost = 0.01m })); }
+  runas (Omar) { Assert.Throws<NotAuthorized>(() => RecordOutsideModelCall(new OutsideModelCall { Model = "Small", Cost = 0.01m })); }
+  runas (Tove) { Assert.Equal(2, ModelCall.Count()); }
+}
+
 /// The bank, and two stewards — each looking after one lot.
 [TestFixture]
 void Stewards() {
@@ -390,4 +438,136 @@ void a_stream_whose_provider_fails_before_it_begins_is_served_by_the_next_candid
   Assert.Equal(ModelCallOutcome.Failed, attempts[0].Outcome);
   Assert.Equal("Large", attempts[1].Model);
   Assert.Equal(ModelCallOutcome.Served, attempts[1].Outcome);
+}
+
+// ── keys ────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// ⭐ A CALL NAMES THE KEY IT RUNS ON, AND THAT KEY'S CLIENT SERVES IT. The router's first model is sent through the
+/// seed fund's key — its script answers, never the model's own — and the meter row says which key, by the bank's id
+/// for it, and charges the call to it.
+[Test(Bank)]
+[runas(Ines)]
+void a_call_on_a_key_is_served_by_that_keys_client_and_recorded_on_it() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text(model + " sent " + request.Model, 1000, 200));
+  var result = SummariseOnKey("fund", "Early dwarf beans.");
+  Assert.Equal("key:fund sent scripted-small", result.Text());
+  Assert.Equal("Small", result.Model);
+
+  var row = ModelCall.Single(c => c.Call == result.Call);
+  Assert.Equal(ModelCallOutcome.Served, row.Outcome);
+  Assert.Equal("fund", row.Account);
+  Assert.Contains("key:fund", row.Scopes);
+  Assert.Contains("lot:A1", row.Scopes);
+  Assert.Equal(2000, row.CostMicros);
+  Assert.Equal(0.002m, SpentOn("key:fund"));
+  // A call that names no key is the model's own, as before: no key on its row.
+  Assert.Equal("Small sent scripted-small", Summarise("beans"));
+  Assert.Equal("", ModelCall.Single(c => c.Call != result.Call).Account);
+}
+
+/// A key the app does not hold is refused before anything happens: nothing held, nothing on the meter, no script
+/// asked. So is a call that charges itself to a key it does not run on — the `key:` scope is the meter's word for
+/// where a call ran.
+[Test(Bank)]
+[runas(Ines)]
+void a_call_naming_a_key_the_app_does_not_hold_is_refused_and_sends_nothing() {
+  ScriptedAnswer.Stub((model, request) => { new Heard { What = "asked", About = model }; return Scripted.Text("Beans."); });
+  var refused = Assert.Throws<LlmKeyRefused>(() => SummariseOnKey("ghost", "beans"));
+  Assert.Equal("ghost", refused.Key);
+  Assert.Contains("holds no model key 'ghost'", refused.Message);
+  Assert.Throws<LlmKeyRefused>(() => await Llm.Complete(RequestOf("beans"), new LlmCall { Scopes = ["key:fund"] }));
+  Assert.Throws<LlmKeyRefused>(() => await Llm.Complete(RequestOf("beans"), new LlmCall { Key = "members", Scopes = ["key:fund"] }));
+  Assert.Equal(0, ModelCall.Count());
+  Assert.Equal(0, LlmHold.Count());
+  Assert.Equal(0, Heard.Count(h => h.What == "asked"));
+}
+
+/// ⭐ A CALL ON A KEY STAYS ON IT. Reasoning wants the large model first and the small one behind it. On the fund's
+/// key the large one fails and the call moves to the small one — through the same key. The members' key serves the
+/// small model alone: the large one is dropped with that reason, and when the small one fails too the call fails —
+/// it is never sent through the fund's key or a model's own client.
+[Test(Bank)]
+[runas(Ines)]
+void a_call_on_a_key_never_falls_back_to_another_key_or_the_models_own_client() {
+  // Each script fails in its own name — and the meter keeps what each failure said — so a row says which client it went to.
+  ScriptedAnswer.Stub((model, request) => {
+    if (request.Model == "scripted-large" || model == "key:members") { throw new ExternalServiceException(model + " is down"); }
+    return Scripted.Text("from " + model + " as " + request.Model);
+  });
+  var served = ReasonOnKey("fund", "Is a ten-year-old bean still viable?");
+  Assert.Equal("from key:fund as scripted-small", served.Text());
+  Assert.Equal(2, served.Attempts);
+  var first = ModelCall.Single(c => c.Call == served.Call && c.Attempt == 0);
+  Assert.Equal("Large", first.Model);
+  Assert.Equal(ModelCallOutcome.Failed, first.Outcome);
+  Assert.Equal("key:fund is down", first.Problem);
+  Assert.Equal(2, ModelCall.Count(c => c.Call == served.Call && c.Account == "fund"));
+
+  Assert.Throws<ExternalServiceException>(() => ReasonOnKey("members", "Is a ten-year-old bean still viable?"));
+  var failed = ModelCall.Single(c => c.Account == "members");
+  Assert.Equal("Small", failed.Model);
+  Assert.Equal(ModelCallOutcome.Failed, failed.Outcome);
+  Assert.Equal("key:members is down", failed.Problem);
+  // The large model, dropped by the key, with the reason.
+  Assert.Contains("{\"Model\":\"Large\",\"Reason\":\"the key", failed.Rejected!.ToString());
+  Assert.Contains("members\\u0027 does not serve it", failed.Rejected!.ToString());
+  // Three attempts in all, every one on the key its call named.
+  Assert.Equal(3, ModelCall.Count());
+  Assert.Equal(0, ModelCall.Count(c => c.Account == ""));
+}
+
+/// ⭐ WHO SPENDS A KEY IS THE APP'S TO SAY. The bank keeps Omar off the seed fund's key: his call on it is refused —
+/// a plain call and a decision alike — before anything is held or sent, while the members' key serves him. The bank's
+/// own code, with nobody signed in, runs on the fund's key.
+[Test(Bank)]
+void a_signed_in_caller_spends_only_the_keys_the_app_lets_them() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("from " + model));
+  runas (Omar) {
+    var refused = Assert.Throws<LlmKeyRefused>(() => SummariseOnKey("fund", "beans"));
+    Assert.Equal("fund", refused.Key);
+    Assert.Contains("You may not spend the model key 'fund'", refused.Message);
+    Assert.Throws<LlmKeyRefused>(() => await Llm.Decide<Verdict>("Early beans.", "Test it?", new LlmCall { Key = "fund" }));
+    Assert.Equal("from key:members", SummariseOnKey("members", "beans").Text());
+  }
+  Assert.Equal("from key:fund", SummariseOnKey("fund", "beans").Text());
+  runas (Ines) {
+    Assert.Equal(1, ModelCall.Count(c => c.Account == "members"));
+    Assert.Equal(1, ModelCall.Count(c => c.Account == "fund"));
+    Assert.Equal(2, ModelCall.Count());
+  }
+}
+
+/// A call that names no key runs on the app's default one, when it has one.
+[Test(Bank)]
+[runas(Ines)]
+void the_default_key_serves_a_call_that_names_none() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("from " + model));
+  DefaultModelKey.Stub(() => "fund");
+  Assert.Equal("from key:fund", Summarise("beans"));
+  var row = ModelCall.Single();
+  Assert.Equal("fund", row.Account);
+  Assert.Contains("key:fund", row.Scopes);
+}
+
+/// ⭐ A FORM KEPT FROM 2.9 RUNS WHERE A CALL THAT NAMES NO KEY DOES. Code written before keys routes and charges without
+/// naming one; on an app with a default key that code is routed on the default key — never round it onto the models' own
+/// clients — and a caller the app keeps off that key is refused, as their call would be.
+[Test(Bank)]
+void the_forms_kept_from_2_9_run_on_the_default_key_and_refuse_a_caller_kept_off_it() {
+  DefaultModelKey.Stub(() => "members");
+  var facts = new LlmTaskFacts { Kind = LlmTaskKind.Reason };
+  runas (Ines) {
+    // The bank sends reasoning to Large first; the members' key serves Small alone.
+    var route = RouteFor(facts);
+    Assert.Equal(1, route.Ordered.Count);
+    Assert.Equal("Small", route.Ordered[0]);
+    Assert.Contains("does not serve it", route.Rejected[0].Reason);
+    Assert.Equal("Small", RouteOrRefuse(facts).Ordered[0]);
+    Assert.Contains("key:members", ScopesOf(new LlmCall(), "Small"));
+  }
+  DefaultModelKey.Stub(() => "fund");
+  runas (Omar) {
+    Assert.Throws<LlmKeyRefused>(() => RouteFor(facts));
+    Assert.Throws<LlmKeyRefused>(() => ScopesOf(new LlmCall(), "Small"));
+  }
 }

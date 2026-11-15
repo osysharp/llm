@@ -111,6 +111,7 @@ class DecisionEnvelope {
 /// `DecideWith.Stub((request, call) => new LlmDecided { … });`.
 public LlmDecided DecideWith(LlmDecisionRequest decision, LlmCall call) {
   RequireGeneration();
+  var key = KeyFor(call);
   var walk = new LlmWalk { Call = Guid.NewGuid() };
   if (call.Kind == LlmTaskKind.Generate) { call.Kind = LlmTaskKind.Decide; }
   var chat = DecisionChatRequest(decision);
@@ -118,7 +119,7 @@ public LlmDecided DecideWith(LlmDecisionRequest decision, LlmCall call) {
   facts.NeedsDecision = true;
   facts.NeedsStructuredOutput = true;
   facts.InputTokens = (decision.Question.Length + decision.Input.Length + decision.SchemaJson.Length + 3) / 4;
-  var route = RouteOrRefuse(facts);
+  var route = KeyedRouteOrRefuse(facts, key);
   var index = 0;
   while (index < route.Ordered.Count) {
     var name = route.Ordered[index];
@@ -126,12 +127,13 @@ public LlmDecided DecideWith(LlmDecisionRequest decision, LlmCall call) {
     if (walk.Tried.Contains(name)) { continue; }
     walk.Tried.Add(name);
     var model = ModelNamed(name);
-    if (!model.Decides() && !model.Chats()) { continue; }
+    var decides = DecidesOn(model, key);
+    if (!decides && !ChatsOn(model, key)) { continue; }
 
     // A decision's answer is small: a value and a number — smaller still from a model built for it.
-    var admission = Admit(walk, ModelCallKind.Decide, name, model, facts, route, call, model.Decides() ? 64 : 512);
+    var admission = KeyedAdmit(walk, ModelCallKind.Decide, name, model, facts, route, call, decides ? 64 : 512, key);
     if (admission.Refused.Refusal == LlmHoldRefusal.OverBudget) {
-      route = StepDownOrStop(walk, admission.Refused, facts);
+      route = KeyedStepDownOrStop(walk, admission.Refused, facts, key);
       index = 0;
       continue;
     }
@@ -140,12 +142,12 @@ public LlmDecided DecideWith(LlmDecisionRequest decision, LlmCall call) {
     var started = DateTime.UtcNow;
     LlmDecision? made = null;
     try {
-      if (model.Decides()) {
+      if (decides) {
         decision.Model = model.ProviderModel();
-        made = EveryModelIsScripted() ? ScriptedDecision(name, decision) : model.Decider!.Decide(decision);
+        made = EveryModelIsScripted() ? ScriptedDecision(name, decision) : DeciderOn(model, key).Decide(decision);
       } else {
         chat.Model = model.ProviderModel();
-        var response = EveryModelIsScripted() ? ScriptedAnswer(name, chat) : model.Client!.Complete(chat);
+        var response = EveryModelIsScripted() ? ScriptedAnswer(name, chat) : ClientOn(model, key).Complete(chat);
         made = DecisionFrom(response);
       }
     } catch (ExternalServiceException e) {

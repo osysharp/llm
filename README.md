@@ -60,6 +60,7 @@ It has no screens. It is the layer other packages and your own pages build on.
 | **Fallback** | The router's order is the fallback order. A provider that fails (an outage, a rate limit, an overload) is recorded and the next model is asked. A stream falls back until its first event; after that the answer is that model's. |
 | **Budgets** | `SetBudget("requester", "", LlmBudgetWindow.Day, 5m)` — five dollars a day for each person. A budget is for a scope: `app`, `requester`, `model`, or any scope a caller names on its calls (`task:8f1c…`, `agent:Screener`). Per day, per month or in total. A call that does not fit is refused before anything is sent (`LlmBudgetExceeded`) — or, when the budget or the call says `StepDown`, the router is asked again with what is left as the ceiling and a cheaper model serves. |
 | **The meter** | One `ModelCall` row per attempt: the model, the provider's id for it, the router's rule, the facts and the rejections as JSON, who asked, the scopes charged, the provider's token counts (cached reads and writes apart), the cost in millionths of a dollar and the price-book row it was priced from. Written once, never changed. `SpentOn("task:" + task.Id)` totals a scope. |
+| **Calls made elsewhere** | `RecordOutsideModelCall(new OutsideModelCall { Model, InputTokens, OutputTokens, CacheReadTokens, Cost, Account, At, Purpose, Scopes })` puts a call a host or another system ran on its own key on the meter, as it was measured there: a `ModelCall` with `Kind == Outside`, the account it ran on by name (`Account`, never the key), and when (`At`). `Cost` null: priced from the price book as it stood then. `SpentOn` and every reader by scope see it with the app's own calls. It counts against every budget an ordinary call with the same scopes falls under, in the period it ran in — after the fact: nothing is held and it is never refused; when it takes a budget past its limit the row's `Problem` says so, and the next ordinary call against that budget is refused. `LlmSpend.OutsideMicros` and `SpentFromOutsideIn(scope, subject, window)` say how much of a budget's use came from outside; charge a key's own calls and the calls recorded from it to one scope (`"key:" + name`) to give that key one budget. For whoever `RecordsModelCalls` admits, and the app's own code. |
 | **The price book** | `SetModelPrice("Fast", 0.10m, 0.50m)` — dollars per million tokens, from a moment on. A call keeps the price it was made at: re-pricing never rewrites what was spent. Until the book has a row, the price on the model's own declaration applies. |
 | **Typed values** | `Llm.Extract<T>` sends `T`'s own schema (`Json.SchemaOf<T>()`, with the words you wrote on its members) and reads the answer as a `T`. An answer that is not the shape is sent back to the model once. |
 | **Typed decisions** | `Llm.Decide<T>` answers a `Decision<T>`: the value, a confidence, and whether that confidence is calibrated. A model built to decide (`LlmModel.Decider`) serves it when you have one; any chat model can stand in, and says its confidence is its own estimate. |
@@ -69,12 +70,13 @@ It has no screens. It is the layer other packages and your own pages build on.
 
 ## Who may do what
 
-Three policies, each with a default you override by declaring it:
+Four policies, each with a default you override by declaring it:
 
 ```osy
 policy UsesModels        => IsStaff;      // who may call a model at all        (default: everyone)
 policy ReadsModelUsage   => IsFinance;    // who reads the meter                (default: nobody)
 policy ManagesModelSpend => IsAdmin;      // who sets prices and budgets        (default: nobody)
+policy RecordsModelCalls => IsBuildHost;  // who records a call made elsewhere  (default: who manages spend)
 ```
 
 ## Calls
@@ -108,12 +110,38 @@ if (d.Value == Urgency.High && d.IsAtLeast(0.8m)) { Escalate(message); }
 ```
 
 A call is refused, before anything is sent, with an exception you can tell apart: `LlmSwitchedOff`, `LlmRouteDenied`,
-`LlmBudgetExceeded` (it carries the scope, the subject, the window and what is left), `LlmBusy` — all of them
-`LlmRefused`. A provider's own failure is an `ExternalServiceException`.
+`LlmBudgetExceeded` (it carries the scope, the subject, the window and what is left), `LlmBusy`, `LlmKeyRefused` (a key
+the app does not hold, or one the caller may not spend) — all of them `LlmRefused`. A provider's own failure is an `ExternalServiceException`.
 
 Calls run from a task too: `Parallel.ForEach(notes, note => { Summarise(note); })` meters and budgets each one. The
 kit's own writes are committed by themselves, so a call in the middle of your work commits none of your work, and a
 call whose surrounding work then fails is still on the meter.
+
+## Keys
+
+An app that holds more than one key for a provider — one per team, one per customer — lists them, each by its own id,
+and a call names the one it runs on:
+
+```osy
+app.Llm = new LlmSetup {
+  Models = [ new LlmModel { Name = "Fast", Model = "claude-haiku-4-5" } ],
+  Keys = [
+    new LlmKey { Id = "team-a", Client = new AnthropicClient { ApiKey = Secret.TeamAKey } },
+    new LlmKey { Id = "team-b", Client = new AnthropicClient { ApiKey = Secret.TeamBKey }, Models = ["Fast"], MaxConcurrent = 4 },
+  ],
+  DefaultKey = "team-a",                                          // a call that names no key
+};
+policy UsesModelKey(string key) => key == "team-a" || IsTeamB;    // who may spend which key; everyone, until you say
+
+var answer = await Llm.Complete(request, new LlmCall { Key = "team-b" });
+```
+
+Every model the router orders for a keyed call is sent through that key's client, and the call never moves to another
+key or a model's own client: a model the key does not serve (`Models`) is dropped with that reason, and when every model
+on it fails the call fails. The meter records the key's id on every row (`ModelCall.Account`) and charges the call to
+`key:<id>`, so `SetBudget("key", "team-b", …)` holds that key's calls — and the calls recorded on it from elsewhere
+(`RecordOutsideModelCall` with `Account = "team-b"`). The id is plain text the app chooses, never the key: the compiler
+refuses an id built from a secret.
 
 ## Budgets
 
@@ -210,6 +238,7 @@ Each of these is a test in the kit's test app:
 | | |
 |---|---|
 | A meter row is made only by the call path, and never changed | `a_meter_row_is_written_only_by_the_call_path_and_never_changed` |
+| A call made elsewhere is recorded only by whom the app names, never on the meter's own scopes | `a_call_made_somewhere_else_is_recorded_on_the_meter_as_it_was_measured_there` |
 | What a budget has counted is changed only by the call path | `what_a_budget_has_counted_is_changed_only_by_the_call_path` |
 | Budgets are set only by who manages the spend, through `SetBudget` | `budgets_are_set_only_by_who_manages_the_spend_and_only_through_the_kit` |
 | Prices are set only by who manages the spend, through `SetModelPrice` | `prices_are_set_only_by_who_manages_the_spend_and_only_through_the_kit` |

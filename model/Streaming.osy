@@ -11,12 +11,13 @@ namespace Osysharp.Llm;
 /// `Llm.Stream(request, call)` is this function.
 public stream<LlmStreamEvent> StreamWith(LlmRequest request, LlmCall call) {
   RequireGeneration();
+  var key = KeyFor(call);
   var walk = new LlmWalk { Call = Guid.NewGuid() };
   var maxOut = request.MaxTokens ?? 0;
   var facts = FactsOf(request, call, maxOut);
   // Somebody is reading it as it arrives.
   facts.LatencySensitivity = LlmLatencySensitivity.Interactive;
-  var route = RouteOrRefuse(facts);
+  var route = KeyedRouteOrRefuse(facts, key);
   var served = false;
   var index = 0;
   while (index < route.Ordered.Count && !served) {
@@ -25,11 +26,11 @@ public stream<LlmStreamEvent> StreamWith(LlmRequest request, LlmCall call) {
     if (walk.Tried.Contains(name)) { continue; }
     walk.Tried.Add(name);
     var model = ModelNamed(name);
-    if (!model.Chats()) { continue; }
+    if (!ChatsOn(model, key)) { continue; }
 
-    var admission = Admit(walk, ModelCallKind.Stream, name, model, facts, route, call, maxOut > 0 ? maxOut : model.MaxOutputTokens);
+    var admission = KeyedAdmit(walk, ModelCallKind.Stream, name, model, facts, route, call, maxOut > 0 ? maxOut : model.MaxOutputTokens, key);
     if (admission.Refused.Refusal == LlmHoldRefusal.OverBudget) {
-      route = StepDownOrStop(walk, admission.Refused, facts);
+      route = KeyedStepDownOrStop(walk, admission.Refused, facts, key);
       index = 0;
       continue;
     }
@@ -45,7 +46,7 @@ public stream<LlmStreamEvent> StreamWith(LlmRequest request, LlmCall call) {
     LlmStreamEvent? closing = null;
     request.Model = model.ProviderModel();
     try {
-      foreach (var e in StreamOf(model, name, request)) {
+      foreach (var e in KeyedStreamOf(model, name, request, key)) {
         began = true;
         if (e.Kind == LlmStreamEventKind.MessageComplete) {
           complete = true;
@@ -82,12 +83,18 @@ public stream<LlmStreamEvent> StreamWith(LlmRequest request, LlmCall call) {
   if (!served) { NoneServed(walk); }
 }
 
-/// What one model streams for `request`: its provider, or the script in a test that scripts every model
-/// (`EveryModelIsScripted`).
-stream<LlmStreamEvent> StreamOf(LlmModel model, string name, LlmRequest request) {
+/// What one model streams for `request`: its provider — through the key's client on a keyed call — or the script in a
+/// test that scripts every model (`EveryModelIsScripted`).
+internal stream<LlmStreamEvent> KeyedStreamOf(LlmModel model, string name, LlmRequest request, LlmKey? key) {
   if (EveryModelIsScripted()) {
     foreach (var e in new ScriptedModel { Name = name }.Stream(request)) { yield return e; }
   } else {
-    foreach (var e in model.Client!.Stream(request)) { yield return e; }
+    foreach (var e in ClientOn(model, key).Stream(request)) { yield return e; }
   }
+}
+
+/// Obsolete since 2.11.0 — use `StreamOf(model, name, request, key)`. Kept so code written against 2.9 still compiles:
+/// streamed on the key a call that names none runs on (`KeyWhenNoneNamed`).
+stream<LlmStreamEvent> StreamOf(LlmModel model, string name, LlmRequest request) {
+  foreach (var e in KeyedStreamOf(model, name, request, KeyWhenNoneNamed())) { yield return e; }
 }

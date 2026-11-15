@@ -17,4 +17,10 @@ app.Llm = new LlmSetup {
   ],
   Default = "Small",
   Router = new SeedBankRouter(),
+  // Two keys of the bank's own, each answered by a script of its own name so a test sees which key served: the seed
+  // fund's, which serves every model; and the members' — the small model alone, one call at a time.
+  Keys = [
+    new LlmKey { Id = "fund", Client = new ScriptedModel { Name = "key:fund" } },
+    new LlmKey { Id = "members", Client = new ScriptedModel { Name = "key:members" }, Models = ["Small"], MaxConcurrent = 1 },
+  ],
 };

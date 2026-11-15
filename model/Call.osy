@@ -8,6 +8,11 @@ public class LlmCall {
   /// The model to serve with, by the app's name for it. It can only NARROW what the router admits: naming a model the
   /// policy does not allow for this call is a refusal, never an override. Null: the router's first choice.
   public string? Model;
+  /// ⭐ THE KEY IT RUNS ON, by the app's id for it (`LlmSetup.Keys`). Every model of the call is served through that
+  /// key's client, and nothing moves it to another key. A key the app does not hold, or one the signed-in caller may
+  /// not spend (`UsesModelKey`), is refused before anything is sent. Null: the app's `DefaultKey` — and with none, the
+  /// model's own `Client`.
+  public string? Key;
   /// What kind of work this is, and which step of a larger job — what the router's floors and tiers are declared per.
   public LlmTaskKind Kind = LlmTaskKind.Generate;
   public LlmStep Step = LlmStep.Call;
@@ -101,6 +106,13 @@ public class LlmBudgetExceeded : LlmRefused {
   public long LeftMicros = 0;
 }
 
+/// The call named a key the app does not hold, or one the signed-in caller may not spend (`UsesModelKey`). Nothing
+/// was held, written or sent.
+public class LlmKeyRefused : LlmRefused {
+  /// The key it named.
+  public string Key = "";
+}
+
 /// Every candidate was already serving as many calls as it allows.
 public class LlmBusy : LlmRefused { }
 
@@ -121,18 +133,74 @@ void RequireGeneration() {
   }
 }
 
+// ── the key ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// The key a call that names none runs on — the app's `LlmSetup.DefaultKey`. A function of its own so a test can
+/// answer it: `DefaultModelKey.Stub(() => "own");`.
+public string DefaultModelKey() { return App.Setting<LlmSetup>().DefaultKey; }
+
+/// The key `id` names among the keys the app holds. Null when it holds none by that id.
+LlmKey? HeldKey(string id) {
+  foreach (var k in App.Setting<LlmSetup>().Keys) { if (k.IdOf() == id) { return k; } }
+  return null;
+}
+
+/// ⭐ MAY THIS CALLER SPEND THE KEY `key`? Refused (`LlmKeyRefused`) when the app holds no key by that id, or when
+/// somebody is signed in and the app's `UsesModelKey` says no. What `Llm.Complete` checks before every keyed call —
+/// and what work that will run on a key checks before it starts (`AgentRef.WithKey`), so it is not refused halfway.
+// SECURITY-INVARIANT(llm-a-key-is-spent-only-by-whom-the-app-lets): a signed-in caller's call runs on a key only when
+// the app's `UsesModelKey` admits them for THAT key — checked here, before any hold, row or send, for a plain, a
+// streamed and a decided call alike. Failure mode: a signed-in user of one product has the app run their work on
+// another product's key, and that key's owner pays for it. Guarded by tests/calls.test.osy
+// `a_signed_in_caller_spends_only_the_keys_the_app_lets_them`.
+public void RequireModelKey(string key) {
+  if (HeldKey(key) == null) {
+    throw new LlmKeyRefused($"This app holds no model key '{key}'. A call runs on one of the keys the app holds "
+      + "(`LlmSetup.Keys`), by its id. Nothing was sent.") { Key = key };
+  }
+  if (Security.CurrentUserId != null && !UsesModelKey(key)) {
+    throw new LlmKeyRefused($"You may not spend the model key '{key}'. The app says who may: "
+      + "`policy UsesModelKey(string key) => …;`. Nothing was sent.") { Key = key };
+  }
+}
+
+/// The key a call runs on — the one it names, else the app's default, else none (the models' own clients) — checked
+/// before anything is held or sent. A call is charged to a `key:` scope only by running on that key: one it names
+/// itself for another key is refused.
+LlmKey? KeyFor(LlmCall call) {
+  var wanted = call.Key ?? DefaultModelKey();
+  var own = wanted == "" ? "" : "key:" + wanted;
+  foreach (var s in call.Scopes) { RequireOwnKeyScope(ScopeLine(s), own, wanted); }
+  foreach (var limit in call.Limits) { RequireOwnKeyScope(ScopeLine(limit.Scope), own, wanted); }
+  if (wanted == "") { return null; }
+  RequireModelKey(wanted);
+  return HeldKey(wanted);
+}
+
+/// The key a call that names none runs on — `KeyFor` of such a call: the app's `DefaultKey`, checked as every call's key
+/// is, else none. What each form 2.9 published without a key runs on, so none of them is a way round the default key.
+internal LlmKey? KeyWhenNoneNamed() { return KeyFor(new LlmCall()); }
+
+void RequireOwnKeyScope(string scope, string own, string wanted) {
+  if (scope.StartsWith("key:") && scope != own) {
+    throw new LlmKeyRefused($"A call is charged to `{scope}` only by running on that key: name it with `LlmCall.Key`. "
+      + "Nothing was sent.") { Key = wanted };
+  }
+}
+
 // ── who, and what it is charged to ──────────────────────────────────────────────────────────────────────────────────
 
 /// Who a call runs for: the signed-in person, or the actor the code is running as. Null for a visitor and the system.
 Guid? CurrentRequester() { return Security.CurrentUserId; }
 
-/// The scopes a call is charged to: the app, the person it runs for, the model that serves it, and whatever its caller
-/// named — each a `kind:subject`, one per line.
-List<string> ScopesOf(LlmCall call, string model) {
+/// The scopes a call is charged to: the app, the person it runs for, the model that serves it, the key it runs on, and
+/// whatever its caller named — each a `kind:subject`, one per line.
+internal List<string> KeyedScopesOf(LlmCall call, string model, LlmKey? key) {
   List<string> scopes = ["app:"];
   var who = CurrentRequester();
   if (who != null) { scopes.Add("requester:" + who!.ToString()); }
   scopes.Add("model:" + model);
+  if (key != null) { scopes.Add("key:" + key!.IdOf()); }
   foreach (var s in call.Scopes) {
     var scope = ScopeLine(s);
     if (scope != "" && !scopes.Contains(scope)) { scopes.Add(scope); }
@@ -148,6 +216,10 @@ List<string> ScopesOf(LlmCall call, string model) {
   }
   return scopes;
 }
+
+/// The form 2.9 published, kept as it was — the kit's own path names its key (`Keyed…`): the scopes
+/// of `call` on the key it runs on (`KeyFor`), as a call charges them.
+List<string> ScopesOf(LlmCall call, string model) { return KeyedScopesOf(call, model, KeyFor(call)); }
 
 /// ⭐ WHAT A MODEL CALL IS CHARGED TO BECAUSE OF WHERE IT IS MADE: in a workflow's run, the workflow —
 /// `workflow:Onboarding` — and that run of it — `run.Onboarding:8f1c…`. Empty anywhere else.
@@ -218,9 +290,33 @@ public int EstimateTokens(LlmRequest request) {
 }
 
 /// The candidates for one call, in order: the app's router's answer — or, with no router, the model the call asked
-/// for or the app's default — with every name checked against the models the app declares. A router can order and
-/// drop; it cannot add.
-LlmRoutingDecision RouteFor(LlmTaskFacts facts) {
+/// for or the app's default — with every name checked against the models the app declares, and, on a key, against the
+/// models that key serves. A router can order and drop; it cannot add.
+internal LlmRoutingDecision KeyedRouteFor(LlmTaskFacts facts, LlmKey? key) {
+  var route = RouteOnModels(facts);
+  if (key == null || route.Denial != null) { return route; }
+  // SECURITY-INVARIANT(llm-a-call-runs-only-on-the-key-it-names): a call on a key is served by that key's client
+  // alone — a model the key does not serve is dropped here with its reason, and the walk sends every candidate
+  // through the key (`ClientOn`), never through another key or a model's own client, whatever fails. Failure mode:
+  // spend lands on a key the meter does not name and passes that key's budget. Guarded by tests/calls.test.osy
+  // `a_call_on_a_key_never_falls_back_to_another_key_or_the_models_own_client`.
+  var id = key!.IdOf();
+  var onKey = new LlmRoutingDecision { RuleId = route.RuleId, Rejected = route.Rejected };
+  foreach (var name in route.Ordered) {
+    if (key!.Serves(name)) { onKey.Ordered.Add(name); }
+    else { onKey.Rejected.Add(new LlmRejection { Model = name, Reason = $"the key '{id}' does not serve it" }); }
+  }
+  if (onKey.Ordered.Count == 0) {
+    onKey.Denial = $"The key '{id}' serves none of the models the app's routing admits for this call.";
+  }
+  return onKey;
+}
+
+/// The form 2.9 published, kept as it was — the kit's own path names its key (`Keyed…`): the route on the
+/// key a call that names none runs on (`KeyWhenNoneNamed`).
+LlmRoutingDecision RouteFor(LlmTaskFacts facts) { return KeyedRouteFor(facts, KeyWhenNoneNamed()); }
+
+LlmRoutingDecision RouteOnModels(LlmTaskFacts facts) {
   var setup = App.Setting<LlmSetup>();
   if (setup.Models.Count == 0) {
     return new LlmRoutingDecision {
@@ -275,9 +371,12 @@ public class LlmPricePoint {
 
 /// The price in force for `model` now: the latest row of the price book that has started, else the price the app
 /// declared with the model.
-public LlmPricePoint PriceOf(string model) {
-  var now = DateTime.UtcNow;
-  var row = ModelPrice.Where(p => p.Model == model && p.From <= now).OrderByDescending(p => p.From).FirstOrDefault();
+public LlmPricePoint PriceOf(string model) { return PriceAt(model, DateTime.UtcNow); }
+
+/// The price that was in force for `model` at `at`: the latest row of the price book that had started by then, else
+/// the price the app declares with the model.
+public LlmPricePoint PriceAt(string model, DateTime at) {
+  var row = ModelPrice.Where(p => p.Model == model && p.From <= at).OrderByDescending(p => p.From).FirstOrDefault();
   if (row != null) {
     return new LlmPricePoint { Input = row.Input, Output = row.Output, CacheRead = row.CacheRead, CacheWrite = row.CacheWrite, Row = row.Id };
   }
@@ -324,26 +423,32 @@ class LlmAdmission {
 }
 
 /// The router's answer for these facts, or the refusal when it admits nothing.
-LlmRoutingDecision RouteOrRefuse(LlmTaskFacts facts) {
-  var route = RouteFor(facts);
+internal LlmRoutingDecision KeyedRouteOrRefuse(LlmTaskFacts facts, LlmKey? key) {
+  var route = KeyedRouteFor(facts, key);
   if (route.Denial != null) { throw new LlmRouteDenied(route.Denial!); }
   return route;
 }
 
+/// The form 2.9 published, kept as it was — the kit's own path names its key (`Keyed…`): on the key a
+/// call that names none runs on (`KeyWhenNoneNamed`).
+LlmRoutingDecision RouteOrRefuse(LlmTaskFacts facts) { return KeyedRouteOrRefuse(facts, KeyWhenNoneNamed()); }
+
 /// ⭐ ADMIT ONE CANDIDATE: check it against what the call may spend, then reserve room for it against every budget
 /// it falls under and take a place among the model's concurrent calls. A candidate that is not admitted is recorded
 /// on the meter with the reason, and nothing is sent to it.
-LlmAdmission Admit(LlmWalk walk, ModelCallKind kind, string name, LlmModel model, LlmTaskFacts facts,
-                   LlmRoutingDecision route, LlmCall call, int outTokens) {
+internal LlmAdmission KeyedAdmit(LlmWalk walk, ModelCallKind kind, string name, LlmModel model, LlmTaskFacts facts,
+                   LlmRoutingDecision route, LlmCall call, int outTokens, LlmKey? key) {
   var price = PriceOf(name);
   var estimate = CostMicros(price, facts.InputTokens, outTokens, 0, 0);
-  var scopes = ScopesOf(call, name);
+  var scopes = KeyedScopesOf(call, name, key);
+  var keyId = key == null ? "" : key!.IdOf();
   var admission = new LlmAdmission { Price = price };
   admission.Opening = new ModelCallOpening {
     Call = walk.Call, Attempt = walk.Attempt, Kind = kind, Model = name, ProviderModel = model.ProviderModel(),
     FallbackFrom = walk.FailedBefore, RouteRule = route.RuleId, FactsJson = JsonSerializer.Serialize(facts),
     RejectedJson = JsonSerializer.Serialize(route.Rejected), Requester = CurrentRequester(),
     Scopes = string.Join("\n", scopes), Purpose = call.Purpose, PriceRow = price.Row, ReservedMicros = estimate,
+    Account = keyId,
   };
 
   if (facts.MaxCostMicros != null && estimate > facts.MaxCostMicros!) {
@@ -353,7 +458,8 @@ LlmAdmission Admit(LlmWalk walk, ModelCallKind kind, string name, LlmModel model
     return admission;
   }
 
-  var hold = HoldModelSpend(walk.Call, name, model.MaxConcurrent, estimate, scopes, call.OnLimit, call.Limits);
+  var hold = HoldModelSpend(walk.Call, name, model.MaxConcurrent, keyId, key == null ? 0 : key!.Cap(), estimate, scopes,
+                            call.OnLimit, call.Limits);
   if (hold.Refusal == LlmHoldRefusal.None) {
     admission.Proceed = true;
     admission.Held = hold.Held;
@@ -372,19 +478,32 @@ LlmAdmission Admit(LlmWalk walk, ModelCallKind kind, string name, LlmModel model
   return admission;
 }
 
+/// The form 2.9 published, kept as it was — the kit's own path names its key (`Keyed…`): admitted on the key
+/// `call` runs on (`KeyFor`), as a call is.
+LlmAdmission Admit(LlmWalk walk, ModelCallKind kind, string name, LlmModel model, LlmTaskFacts facts,
+                   LlmRoutingDecision route, LlmCall call, int outTokens) {
+  return KeyedAdmit(walk, kind, name, model, facts, route, call, outTokens, KeyFor(call));
+}
+
 /// A budget refused a candidate. When it (or the call) says to step down and has not already: the facts get what is
 /// left as their ceiling and the router is asked again — the answer is the new list to walk. Otherwise, and when the
 /// router admits nothing under the ceiling, the call stops here.
-LlmRoutingDecision StepDownOrStop(LlmWalk walk, LlmHoldResult refused, LlmTaskFacts facts) {
+internal LlmRoutingDecision KeyedStepDownOrStop(LlmWalk walk, LlmHoldResult refused, LlmTaskFacts facts, LlmKey? key) {
   if (refused.StepDown && !walk.SteppedDown) {
     walk.SteppedDown = true;
     facts.MaxCostMicros = refused.LeftMicros;
-    var cheaper = RouteFor(facts);
+    var cheaper = KeyedRouteFor(facts, key);
     if (cheaper.Denial == null) { return cheaper; }
   }
   throw new LlmBudgetExceeded(refused.Why) {
     Scope = refused.Scope, Subject = refused.Subject, Window = refused.Window, LeftMicros = refused.LeftMicros,
   };
+}
+
+/// Obsolete since 2.11.0 — use `StepDownOrStop(walk, refused, facts, key)`. Kept so code written against 2.9 still
+/// compiles: a cheaper route on the key a call that names none runs on (`KeyWhenNoneNamed`).
+LlmRoutingDecision StepDownOrStop(LlmWalk walk, LlmHoldResult refused, LlmTaskFacts facts) {
+  return KeyedStepDownOrStop(walk, refused, facts, KeyWhenNoneNamed());
 }
 
 /// The provider answered: settle what was held at what it actually cost, and write the attempt's meter row.
@@ -427,10 +546,11 @@ void NoneServed(LlmWalk walk) {
 /// `CompleteWith.Stub((request, call) => new LlmResult { … });`.
 public LlmResult CompleteWith(LlmRequest request, LlmCall call) {
   RequireGeneration();
+  var key = KeyFor(call);
   var walk = new LlmWalk { Call = Guid.NewGuid() };
   var maxOut = request.MaxTokens ?? 0;
   var facts = FactsOf(request, call, maxOut);
-  var route = RouteOrRefuse(facts);
+  var route = KeyedRouteOrRefuse(facts, key);
   var index = 0;
   while (index < route.Ordered.Count) {
     var name = route.Ordered[index];
@@ -438,11 +558,11 @@ public LlmResult CompleteWith(LlmRequest request, LlmCall call) {
     if (walk.Tried.Contains(name)) { continue; }
     walk.Tried.Add(name);
     var model = ModelNamed(name);
-    if (!model.Chats()) { continue; }
+    if (!ChatsOn(model, key)) { continue; }
 
-    var admission = Admit(walk, ModelCallKind.Complete, name, model, facts, route, call, maxOut > 0 ? maxOut : model.MaxOutputTokens);
+    var admission = KeyedAdmit(walk, ModelCallKind.Complete, name, model, facts, route, call, maxOut > 0 ? maxOut : model.MaxOutputTokens, key);
     if (admission.Refused.Refusal == LlmHoldRefusal.OverBudget) {
-      route = StepDownOrStop(walk, admission.Refused, facts);
+      route = KeyedStepDownOrStop(walk, admission.Refused, facts, key);
       index = 0;
       continue;
     }
@@ -452,7 +572,7 @@ public LlmResult CompleteWith(LlmRequest request, LlmCall call) {
     LlmResponse? response = null;
     try {
       request.Model = model.ProviderModel();
-      response = EveryModelIsScripted() ? ScriptedAnswer(name, request) : model.Client!.Complete(request);
+      response = EveryModelIsScripted() ? ScriptedAnswer(name, request) : ClientOn(model, key).Complete(request);
     } catch (ExternalServiceException e) {
       // The provider failed or refused (an outage, a rate limit, an overload): on to the router's next candidate —
       // never to a model that is not on its list.
@@ -472,6 +592,18 @@ public LlmResult CompleteWith(LlmRequest request, LlmCall call) {
   NoneServed(walk);
   throw new LlmRouteDenied("No model served this call.");
 }
+
+/// Whether a model can chat on this call: through the key's client when it runs on one, else through its own.
+bool ChatsOn(LlmModel model, LlmKey? key) { return key == null ? model.Chats() : key!.Chats(); }
+
+/// Whether a model can decide on this call: through the key's decider when it runs on one, else through its own.
+bool DecidesOn(LlmModel model, LlmKey? key) { return key == null ? model.Decides() : key!.Decides(); }
+
+/// Who a model is sent through on this call: the key's client when it runs on one — and then never the model's own.
+ILlmClient ClientOn(LlmModel model, LlmKey? key) { return key == null ? model.Client! : key!.Client!; }
+
+/// Who a decision is sent to on this call: the key's decider when it runs on one, else the model's own.
+IDecisionModel DeciderOn(LlmModel model, LlmKey? key) { return key == null ? model.Decider! : key!.Decider!; }
 
 LlmModel ModelNamed(string name) {
   foreach (var m in App.Setting<LlmSetup>().Models) { if (m.NameOf() == name) { return m; } }

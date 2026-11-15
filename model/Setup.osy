@@ -18,6 +18,16 @@ virtual policy ReadsModelUsageOf(string scopes) => false;
 /// Who sets prices and budgets. Nobody, until the app says: `policy ManagesModelSpend => IsAdmin;`.
 virtual policy ManagesModelSpend => false;
 
+/// Who records on the meter a model call made somewhere else (`RecordOutsideModelCall`) — what a call cost is put on
+/// the scopes they name. Whoever manages model spend, until the app says: `policy RecordsModelCalls => ManagesModelSpend
+/// || IsBuildHost;`. The app's own code, with nobody signed in, records without it.
+virtual policy RecordsModelCalls => ManagesModelSpend;
+
+/// ⭐ WHICH OF THE APP'S MODEL KEYS A SIGNED-IN CALLER MAY SPEND (`LlmCall.Key`, `AgentRef.WithKey`), by the app's id
+/// for the key. Everyone, until the app says: `policy UsesModelKey(string key) => ModelKey.Any(k => k.Id.ToString() == key
+/// && MemberOf(k.Product));`. App code with nobody signed in chooses any key the app holds.
+virtual policy UsesModelKey(string key) => true;
+
 /// What a million tokens cost on one model, in US dollars. The meter multiplies these by the provider's own counts.
 public class LlmPrice {
   /// A million tokens of prompt.
@@ -66,6 +76,35 @@ public class LlmModel {
   public bool Decides() { return Decider != null; }
 }
 
+/// ⭐ ONE KEY THE APP HOLDS FOR A PROVIDER, by the app's own id for it — never the key itself: the client holds that.
+///
+///     new LlmKey { Id = "team-a", Client = new AnthropicClient { ApiKey = Secret.TeamAKey } }
+///
+/// A call names a key (`LlmCall.Key`) and is then served by this key's client alone: every model the router orders for
+/// it is sent through `Client` (or `Decider`), and the call never moves to another key or to a model's own client. The
+/// meter records the key's id on every row (`ModelCall.Account`) and charges the call to `key:<Id>`, so a budget on
+/// the key (`SetBudget("key", id, …)`) holds the calls made here and those recorded from elsewhere on it.
+public class LlmKey {
+  /// The app's id for the key — what a call names, what the meter records, the subject of the `key:` scope. Plain
+  /// text, at most 200 characters, never anything built from a secret.
+  public string Id = "";
+  /// Who serves text and tool calls on this key — the same client classes a model names, built on this key's secret.
+  public ILlmClient? Client;
+  /// Who serves typed decisions on it. Null: a decision is asked through `Client`.
+  public IDecisionModel? Decider;
+  /// The app's models this key may serve, by their names. Empty: all of them.
+  public List<string> Models = [];
+  /// How many calls may be on their way on this key at once. 0: no cap.
+  public int MaxConcurrent = 0;
+
+  // A setting is confined like a secret — its fields are not copied out — so what a record needs is answered here.
+  public string IdOf() { return Id; }
+  public bool Chats() { return Client != null; }
+  public bool Decides() { return Decider != null; }
+  public bool Serves(string model) { return Models.Count == 0 || Models.Contains(model); }
+  public int Cap() { return MaxConcurrent; }
+}
+
 /// What a call does when a budget it falls under has no room for it.
 public enum LlmOnLimit {
   /// Refuse the call (`LlmBudgetExceeded`). The default.
@@ -86,4 +125,8 @@ public class LlmSetup {
   public ILlmRouter? Router;
   /// How long a reservation holds a budget's room for a call that never reported back (a process that died mid-call).
   public TimeSpan HoldFor = TimeSpan.FromMinutes(10);
+  /// The keys the app holds, each by its own id (`LlmKey`). A call names one with `LlmCall.Key`.
+  public List<LlmKey> Keys = [];
+  /// The key a call that names none runs on, by its id. "": such a call is served by the model's own `Client`.
+  public string DefaultKey = "";
 }
