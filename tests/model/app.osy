@@ -74,6 +74,13 @@ public class SeedBankRouter : ILlmRouter {
       // Two requests the bank's policy answers with a list of its own: a model with a cap, with the cheap one behind
       // it — and a name no setup declares, to show that a router cannot add a model.
       if (facts.RequestedModel == "Narrow") { order = ["Narrow", "Small"]; }
+      else if (facts.RequestedModel == "Liar") {
+        // A router that writes the facts it is handed down below nothing (ORGPOL OP-FP2b): the kit's ceiling must
+        // not read them back.
+        facts.InputTokens = -1000000;
+        facts.MaxOutputTokens = -1000000;
+        order = ["Liar"];
+      }
       else if (facts.RequestedModel == "Ghost") { order = ["Ghost", "Small"]; }
       else if (order.Contains(facts.RequestedModel!)) { order = [facts.RequestedModel!]; }
       else {
@@ -235,6 +242,85 @@ void ForgeAllowance() {
 /// A meter row made up by the app.
 void ForgeMeterRow() {
   new ModelCall { Call = Guid.NewGuid(), Model = "Small", CostMicros = 0 };
+}
+
+// ── the organisation's floor (ORGPOL OP-FP2) ────────────────────────────────────────────────────────────────────────
+
+/// What a summary from one named model came to: its text, or "<type>|<sentence>" when it was refused.
+[SuppressWarning("observability-catch-without-log")]
+string SummaryOrRefusal(string model, string note) {
+  try { return SummariseWith(model, note); }
+  catch (Exception e) { return e.Type + "|" + e.Message; }
+}
+
+/// The same, routed by the bank's own router.
+[SuppressWarning("observability-catch-without-log")]
+string RoutedSummaryOrRefusal(string note) {
+  try { return Summarise(note); }
+  catch (Exception e) { return e.Type + "|" + e.Message; }
+}
+
+/// The same, streamed.
+[SuppressWarning("observability-catch-without-log")]
+string RecitalOrRefusal(string prompt) {
+  try { return Recite(prompt); }
+  catch (Exception e) { return e.Type + "|" + e.Message; }
+}
+
+/// The same, a decision.
+[SuppressWarning("observability-catch-without-log")]
+string VerdictOrRefusal(string note) {
+  try { return Judge(note).Value.ToString(); }
+  catch (Exception e) { return e.Type + "|" + e.Message; }
+}
+
+/// The tokens the month's count holds, read as the app reads it.
+long MonthsTokens() { return LlmOrgUsage.ToList().Sum(u => u.Tokens); }
+
+/// The month's count turned back by the app.
+void LowerTheMonthsCount() {
+  foreach (var u in LlmOrgUsage.ToList()) { u.Tokens = 0; }
+}
+
+/// The month's count deleted by the app.
+void DeleteTheMonthsCount() {
+  foreach (var u in LlmOrgUsage.ToList()) { u.Delete(); }
+}
+
+/// A month's count made by the app, below nothing.
+void ForgeTheMonthsCount() {
+  new LlmOrgUsage { Month = PeriodOf(LlmBudgetWindow.Month, DateTime.UtcNow), Tokens = -1000000 };
+}
+
+/// A note of about 5000 characters — some 1250 tokens of prompt.
+string ALongNote() {
+  var note = "dwarf bean";
+  while (note.Length < 5000) { note = note + note; }
+  return note.Substring(0, 5000);
+}
+
+/// Calls started together, each routed by the bank's router; a refused one is simply not served (ORGPOL OP-FP2b).
+void SummariseTogether(List<string> notes) {
+  Parallel.ForEach(notes, AtOnce(), note => { RoutedSummaryOrRefusal(note); });
+}
+
+/// The first event of a streamed answer — and then the reader walks away from the rest (ORGPOL OP-FP2b).
+string FirstWordOf(string prompt) {
+  var first = "";
+  await foreach (var e in Llm.Stream(prompt)) {
+    first = e.Delta ?? "";
+    break;
+  }
+  return first;
+}
+
+/// What the kit estimates a request carrying a PDF of at least `size` characters of base64 to be.
+int EstimateOfAPdf(int size) {
+  var data = "JVBERi0x";
+  while (data.Length < size) { data = data + data; }
+  var request = RequestOf("Read this.");
+  request.Messages[0].Content.Add(new LlmContentBlock { Kind = LlmBlockKind.Document, MediaType = "application/pdf", DataBase64 = data });
+  return EstimateTokens(request);
 }
 
 /// A budget's count turned back by the app.

@@ -1,0 +1,262 @@
+// Osysharp.Llm — the organisation's floor (ORGPOL OP-FP2): a model list (`LlmSetup.AllowedModels`, a lock) and a monthly
+// token ceiling (`LlmSetup.MonthlyTokens`, a range), judged at each candidate's admission after the app's router.
+//
+// What an organisation set is said here with a stub of the kit's read (`AllowedModelsInForce`, `MonthlyTokensInForce`),
+// and the bank's own setup assigns neither — so what binds is what the read answers, whatever the app wrote. That the
+// read answers the ORGANISATION's value under a real policy version is the platform's test
+// `PolicyProbeOsyTests.ALockedModelList_BindsTheLlmKit_UnderARealPolicyVersion`.
+using Osysharp.Llm;
+using SeedBank;
+
+/// What the app's `catch` is handed when the organisation's list refuses a call.
+string ListRefusal() {
+  return "PolicyRefused|This app tried to use the setting `Osysharp.Llm.LlmSetup.AllowedModels` in a way "
+    + "your organization's policy does not allow.";
+}
+
+/// …and when the month's ceiling does.
+string CeilingRefusal() {
+  return "PolicyRefused|This app tried to use the setting `Osysharp.Llm.LlmSetup.MonthlyTokens` in a way "
+    + "your organization's policy does not allow.";
+}
+
+[Test(Bank)]
+[runas(Ines)]
+void a_locked_model_list_refuses_a_model_outside_it_whatever_the_app_assigns() {
+  ScriptedAnswer.Stub((model, request) => {
+    new Heard { What = "asked", About = model };
+    return Scripted.Text("A line.", 1000, 200);
+  });
+  // The bank assigns no list (any model); the organisation's is the dear model alone.
+  Assert.Equal("", App.Setting<LlmSetup>().AllowedModels);
+  AllowedModelsInForce.Stub(() => "scripted-large");
+
+  Assert.Equal(ListRefusal(), SummaryOrRefusal("Small", "beans"));
+  Assert.Equal(0, Heard.Count(h => h.What == "asked"));
+  var row = ModelCall.Single();
+  Assert.Equal(ModelCallOutcome.Refused, row.Outcome);
+  Assert.Equal("scripted-small", row.ProviderModel);
+  Assert.Contains("does not allow the model 'scripted-small'", row.Problem ?? "");
+
+  // Inside the list, by its exact id or by a prefix, the call is served.
+  Assert.Equal("A line.", SummaryOrRefusal("Large", "beans"));
+  AllowedModelsInForce.Stub(() => "other-model, scripted-sm*");
+  Assert.Equal("A line.", SummaryOrRefusal("Small", "beans"));
+  // A prefix is a prefix, and an id is compared exactly.
+  AllowedModelsInForce.Stub(() => "scripted-smal SCRIPTED-SMALL");
+  Assert.Equal(ListRefusal(), SummaryOrRefusal("Small", "beans"));
+  Assert.Equal(2, Heard.Count(h => h.What == "asked"));
+}
+
+[Test(Bank)]
+[runas(Ines)]
+void the_apps_router_cannot_route_past_the_list() {
+  ScriptedAnswer.Stub((model, request) => {
+    new Heard { What = "asked", About = model };
+    return Scripted.Text("From " + model + ".", 1000, 200);
+  });
+  // The bank's router orders the cheap model first and the dear one behind it. The list keeps the cheap one out: it is
+  // never sent, and the dear one serves.
+  AllowedModelsInForce.Stub(() => "scripted-large");
+  Assert.Equal("From Large.", RoutedSummaryOrRefusal("beans"));
+  Assert.Equal(ModelCallOutcome.Refused, ModelCall.Single(c => c.Model == "Small").Outcome);
+  Assert.Equal(ModelCallOutcome.Served, ModelCall.Single(c => c.Model == "Large").Outcome);
+  Assert.Equal(1, Heard.Count(h => h.What == "asked" && h.About == "Large"));
+
+  // A list that keeps out everything the router orders: refused, nothing sent.
+  AllowedModelsInForce.Stub(() => "scripted-narrow");
+  Assert.Equal(ListRefusal(), RoutedSummaryOrRefusal("beans"));
+  Assert.Equal(1, Heard.Count(h => h.What == "asked"));
+  Assert.Equal(3, ModelCall.Count(c => c.Outcome == ModelCallOutcome.Refused));
+}
+
+[Test(Bank)]
+[runas(Ines)]
+void stream_and_decide_are_held_like_complete() {
+  ScriptedAnswer.Stub((model, request) => {
+    new Heard { What = "asked", About = model };
+    return Scripted.Text("From " + model + ".", 1000, 200);
+  });
+  ScriptedDecision.Stub((model, request) => {
+    new Heard { What = "decided", About = model };
+    return Scripted.Decision("\"Test\"", 0.9m, 400);
+  });
+  AllowedModelsInForce.Stub(() => "scripted-large");
+  // A streamed call walks past the cheap model to the dear one.
+  Assert.Equal("From Large.", RecitalOrRefusal("How long do beans keep?"));
+  Assert.Equal(ModelCallOutcome.Refused, ModelCall.Single(c => c.Kind == ModelCallKind.Stream && c.Model == "Small").Outcome);
+  // A decision's router names the sorter and the cheap model: neither is on the list.
+  Assert.Equal(ListRefusal(), VerdictOrRefusal("Dwarf beans, 2024."));
+  Assert.Equal(0, Heard.Count(h => h.What == "decided"));
+  Assert.Equal(2, ModelCall.Count(c => c.Kind == ModelCallKind.Decide && c.Outcome == ModelCallOutcome.Refused));
+  // And a streamed call with nothing on the list is refused the same way.
+  AllowedModelsInForce.Stub(() => "scripted-sorter");
+  Assert.Equal(ListRefusal(), RecitalOrRefusal("How long do beans keep?"));
+  Assert.Equal(1, Heard.Count(h => h.What == "asked"));
+  // The ceiling holds them too.
+  AllowedModelsInForce.Stub(() => "");
+  MonthlyTokensInForce.Stub(() => 100);
+  Assert.Equal(CeilingRefusal(), RecitalOrRefusal("How long do beans keep?"));
+  Assert.Equal(CeilingRefusal(), VerdictOrRefusal("Dwarf beans, 2024."));
+  Assert.Equal(1, Heard.Count(h => h.What == "asked"));
+  Assert.Equal(0, Heard.Count(h => h.What == "decided"));
+}
+
+[Test(Bank)]
+[runas(Ines)]
+void the_token_ceiling_refuses_the_call_that_would_pass_it() {
+  ScriptedAnswer.Stub((model, request) => {
+    new Heard { What = "asked", About = model };
+    return Scripted.Text("A line.", 1000, 200);
+  });
+  // 5000 tokens a month. Each call asks for its prompt and the most its answer may run to (the cheap model's 1000), and
+  // uses 1200 — so four fit, and the fifth could take the month past 5000.
+  MonthlyTokensInForce.Stub(() => 5000);
+  Assert.Equal("A line.", RoutedSummaryOrRefusal("beans"));
+  Assert.Equal("A line.", RoutedSummaryOrRefusal("beans"));
+  Assert.Equal("A line.", RoutedSummaryOrRefusal("beans"));
+  Assert.Equal("A line.", RoutedSummaryOrRefusal("beans"));
+  Assert.Equal(4800, MonthsTokens());
+  Assert.Equal(CeilingRefusal(), RoutedSummaryOrRefusal("beans"));
+  Assert.Equal(4, Heard.Count(h => h.What == "asked"));
+  var refused = ModelCall.Single(c => c.Outcome == ModelCallOutcome.Refused);
+  Assert.Contains("past your organization's ceiling of 5000 tokens (4800 used)", refused.Problem ?? "");
+  // Refused at once: the dear model behind it counts toward the same month and is not tried.
+  Assert.Equal(5, ModelCall.Count());
+  Assert.Equal(4800, MonthsTokens());
+}
+
+[Test(Bank)]
+void the_app_cannot_delete_or_lower_the_months_count() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("A line.", 1000, 200));
+  // No row yet: the app cannot make one below nothing.
+  runas (Ines) { Assert.Denied(() => { ForgeTheMonthsCount(); UnitOfWork.Commit(); }); UnitOfWork.Discard(); }
+  runas (Ines) { RoutedSummaryOrRefusal("beans"); }
+  // Nobody turns the count back or deletes it — not a caller, not the treasurer who manages the spend.
+  runas (Ines) { Assert.Denied(() => { LowerTheMonthsCount(); UnitOfWork.Commit(); }); UnitOfWork.Discard(); }
+  runas (Ines) { Assert.Denied(() => { DeleteTheMonthsCount(); UnitOfWork.Commit(); }); UnitOfWork.Discard(); }
+  runas (Tove) { Assert.Denied(() => { LowerTheMonthsCount(); UnitOfWork.Commit(); }); UnitOfWork.Discard(); }
+  runas (Tove) { Assert.Denied(() => { DeleteTheMonthsCount(); UnitOfWork.Commit(); }); UnitOfWork.Discard(); }
+  // Taking a person off the meter leaves it as it was: it names nobody.
+  runas (Tove) { ForgetModelCallRequester(Ines.Id); }
+  runas (Ines) {
+    Assert.Equal(1200, MonthsTokens());
+    Assert.Equal(1, LlmOrgUsage.Single().Calls);
+  }
+}
+
+[Test(Bank)]
+[runas(Ines)]
+void an_app_value_of_zero_is_held_inside_the_range() {
+  ScriptedAnswer.Stub((model, request) => {
+    new Heard { What = "asked", About = model };
+    return Scripted.Text("A line.", 1000, 200);
+  });
+  // The bank assigns no ceiling: the kit's default is as good as none.
+  Assert.Equal(9000000000000000000, App.Setting<LlmSetup>().MonthlyTokens);
+  Assert.Equal("A line.", RoutedSummaryOrRefusal("beans"));
+  // 0 is a ceiling of nothing, never "no ceiling" — so an app's 0 sits inside an organisation's range and is held to it
+  // (the read's clamp is the platform's test), and on its own it refuses every call.
+  MonthlyTokensInForce.Stub(() => 0);
+  Assert.Equal(CeilingRefusal(), RoutedSummaryOrRefusal("beans"));
+  Assert.Equal(1, Heard.Count(h => h.What == "asked"));
+}
+
+[Test(Bank)]
+void the_floors_reads_answer_only_who_may_call_a_model() {
+  // A direct call: the barred keeper may not call a model, and is refused the floor's reads too.
+  runas (Rut) {
+    Assert.Denied(() => AllowedModelsInForce());
+    Assert.Denied(() => MonthlyTokensInForce());
+  }
+  runas (Ines) {
+    Assert.Equal("", AllowedModelsInForce());
+    Assert.Equal(9000000000000000000, MonthlyTokensInForce());
+  }
+}
+
+// ── the ceiling against hostile app code (ORGPOL OP-FP2b) ───────────────────────────────────────────────────────────
+
+[Test(Bank)]
+[runas(Ines)]
+void a_negative_or_understated_output_bound_cannot_pass_the_ceiling() {
+  ScriptedAnswer.Stub((model, request) => {
+    new Heard { What = "asked", About = model + " " + (request.MaxTokens ?? 0) };
+    return Scripted.Text("A line.", 1000, 200);
+  });
+  // The liar declares its most output as -1000000, and the bank's router writes the facts' prompt down to -1000000.
+  // The kit asks the ceiling for its own count: the prompt as it will be sent (about 1250 tokens) and at least its own
+  // bound on the answer (4096) — past 5000.
+  MonthlyTokensInForce.Stub(() => 5000);
+  Assert.Equal(CeilingRefusal(), SummaryOrRefusal("Liar", ALongNote()));
+  Assert.Equal(0, Heard.Count(h => h.What == "asked"));
+  Assert.Equal(0, MonthsTokens());
+  // Under a wider ceiling it is served — and the provider is asked for no more than the number that was checked.
+  MonthlyTokensInForce.Stub(() => 100000);
+  Assert.Equal("A line.", SummaryOrRefusal("Liar", "beans"));
+  Assert.Equal(1, Heard.Count(h => h.About == "Liar 4096"));
+  Assert.Equal("A line.", SummaryOrRefusal("Small", "beans"));
+  Assert.Equal(1, Heard.Count(h => h.About == "Small 1000"));
+}
+
+[Test(Bank)]
+[runas(Ines)]
+void calls_started_together_cannot_pass_the_ceiling_between_them() {
+  // Each call takes its time, so both are on their way before either is answered; each asks some 1011 tokens (its
+  // prompt and the cheap model's 1000) of a ceiling of 1700 — 60% each. One fits; the other is refused, nothing sent.
+  ScriptedAnswer.Stub((model, request) => {
+    Security.HashPassword("a model that takes its time");
+    return Scripted.Text("A line.", 1000, 200);
+  });
+  MonthlyTokensInForce.Stub(() => 1700);
+  SummariseTogether(["a", "b"]);
+  Assert.Equal(1, ModelCall.Count(c => c.Outcome == ModelCallOutcome.Served));
+  Assert.Equal(1, ModelCall.Count(c => c.Outcome == ModelCallOutcome.Refused));
+  Assert.Contains("past your organization's ceiling of 1700 tokens", ModelCall.Single(c => c.Outcome == ModelCallOutcome.Refused).Problem ?? "");
+  // What stays counted is what the served call's provider reported.
+  Assert.Equal(1200, MonthsTokens());
+}
+
+[Test(Bank)]
+[runas(Ines)]
+void an_abandoned_stream_is_counted_at_its_reservation() {
+  ScriptedAnswer.Stub((model, request) => {
+    new Heard { What = "asked", About = model };
+    return Scripted.Text("Beans keep for years.", 1000, 200);
+  });
+  MonthlyTokensInForce.Stub(() => 1500);
+  // The reader takes the first event and walks away: the provider was asked all the same, and the call counts at what
+  // it reserved — its prompt and the most its answer may run to.
+  Assert.Equal("Beans keep for years.", FirstWordOf("How long do beans keep?"));
+  Assert.True(MonthsTokens() >= 1000);
+  // So the next call that would take the month past the ceiling is refused, nothing sent.
+  Assert.Equal(CeilingRefusal(), RecitalOrRefusal("How long do beans keep?"));
+  // (What the abandoned stream's own script wrote went with the stream, so the refusal is read off the meter.)
+  var refused = ModelCall.Single(c => c.Kind == ModelCallKind.Stream && c.Outcome == ModelCallOutcome.Refused);
+  Assert.Contains("past your organization's ceiling of 1500 tokens", refused.Problem ?? "");
+}
+
+[Test(Bank)]
+[runas(Ines)]
+void a_failure_before_anything_is_sent_gives_the_reservation_back() {
+  ScriptedAnswer.Stub((model, request) => {
+    if (model == "Small") { throw new ExternalServiceException("The cheap model is down."); }
+    return Scripted.Text("From " + model + ".", 1000, 200);
+  });
+  MonthlyTokensInForce.Stub(() => 5000);
+  // The cheap model fails and gives back what it reserved; the dear one serves. The month counts the dear one's
+  // tokens alone.
+  Assert.Equal("From Large.", RoutedSummaryOrRefusal("beans"));
+  Assert.Equal(1200, MonthsTokens());
+  Assert.Equal(1, LlmOrgUsage.Single().Calls);
+}
+
+[Test(Bank)]
+[runas(Ines)]
+void a_document_is_estimated_by_its_size() {
+  // A PDF is no longer read as free: a flat allowance, and more for a bigger file.
+  var small = EstimateOfAPdf(1000);
+  var large = EstimateOfAPdf(100000);
+  Assert.True(small >= 1500);
+  Assert.True(large >= small + 10000);
+}

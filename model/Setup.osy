@@ -129,4 +129,16 @@ public class LlmSetup {
   public List<LlmKey> Keys = [];
   /// The key a call that names none runs on, by its id. "": such a call is served by the model's own `Client`.
   public string DefaultKey = "";
+  /// ⭐ WHICH PROVIDER MODELS A CALL MAY BE SENT TO — an organisation's lock (ORGPOL OP-FP2). Entries are separated by
+  /// commas or white space; each is a provider's id for a model (`claude-haiku-4-5`, what `LlmModel.Model` says) or a
+  /// prefix ending in `*` (`claude-haiku-*`). Compared exactly, case and all. Empty: any model. A candidate outside it
+  /// is never sent — whatever the app's router ordered — and a call with no candidate inside it is refused
+  /// (`PolicyRefused`, key `Osysharp.Llm.LlmSetup.AllowedModels`).
+  [OrgPolicy(OrgPolicyMode.Lock)] public string AllowedModels = "";
+  /// ⭐ THE MOST TOKENS THE APP'S CALLS MAY USE IN ONE CALENDAR MONTH (UTC) — an organisation's range (ORGPOL OP-FP2):
+  /// prompt, answer and cache tokens as the provider reports them, counted in `LlmOrgUsage`. A call that could take
+  /// the month past it is refused before anything is sent (`PolicyRefused`, key `Osysharp.Llm.LlmSetup.MonthlyTokens`).
+  /// Always the ceiling — never "0 means none" — so an app's own value is held inside the organisation's range; the
+  /// default is as good as none.
+  [OrgPolicy(OrgPolicyMode.Range)] public long MonthlyTokens = 9000000000000000000;
 }

@@ -1,0 +1,132 @@
+// The organisation's floor under every model call (ORGPOL OP-FP2): which provider models a call may be sent to
+// (`LlmSetup.AllowedModels`, a lock) and how many tokens the app's calls may use in a month (`LlmSetup.MonthlyTokens`,
+// a range). Both are read through `App.Setting<LlmSetup>()`, which gives the organisation's value whatever the app
+// assigned; both are judged at each candidate's admission, after the app's router has ordered the candidates.
+namespace Osysharp.Llm;
+
+/// The organisation's model list as this call reads it — `LlmSetup.AllowedModels`. Top-level so a test can say what
+/// an organisation set: `AllowedModelsInForce.Stub(() => "claude-haiku-*");`. Answered to whoever may call a model.
+[Authorize(UsesModels)]
+public string AllowedModelsInForce() { return App.Setting<LlmSetup>().AllowedModels; }
+
+/// The monthly token ceiling as this call reads it — `LlmSetup.MonthlyTokens`. Top-level so a test can say what an
+/// organisation set: `MonthlyTokensInForce.Stub(() => 5000);`. Answered to whoever may call a model.
+[Authorize(UsesModels)]
+public long MonthlyTokensInForce() { return App.Setting<LlmSetup>().MonthlyTokens; }
+
+/// What the month's count answered a reservation (ORGPOL OP-FP2b): taken or not, and what the month stood at.
+public class LlmOrgReservation {
+  public bool Taken = false;
+  /// The tokens the month had counted before this call, and the ceiling it was judged against.
+  public long Used = 0;
+  public long Ceiling = 0;
+  /// The month the room was taken in: the call settles there, whenever it is answered.
+  public DateOnly Month;
+}
+
+/// ⭐ RESERVE ONE CALL'S TOKENS AGAINST THE ORGANISATION'S CEILING, atomically (ORGPOL OP-FP2b): behind the turnstile,
+/// read what this month has counted, refuse when `asked` more would take it past the ceiling, else add `asked` to it —
+/// committed at once, in a unit of work of its own, so a call started a moment later reads it. The call settles the
+/// difference when it is answered (`SettleModelSpend`); a call that fails before anything is sent gives it back; a
+/// stream its reader walks away from keeps it.
+[Server, Authorize(UsesModels), CommitsAlone]
+internal LlmOrgReservation ReserveOrgTokens(long asked) {
+  var ceiling = MonthlyTokensInForce();
+  var month = PeriodOf(LlmBudgetWindow.Month, DateTime.UtcNow);
+  PassTurnstile();
+  var usage = LlmOrgUsage.FirstOrDefault(u => u.Month == month);
+  long used = usage == null ? 0 : usage!.Tokens;
+  if (asked < 1 || used + asked > ceiling) {
+    UnitOfWork.Discard();
+    return new LlmOrgReservation { Taken = false, Used = used, Ceiling = ceiling, Month = month };
+  }
+  if (usage == null) { usage = new LlmOrgUsage { Month = month }; }
+  usage.Tokens += asked;
+  return new LlmOrgReservation { Taken = true, Used = used, Ceiling = ceiling, Month = month };
+}
+
+/// The most an answer may run to, as the ceiling is asked for it and as the provider is sent it (`LlmRequest.MaxTokens`):
+/// the call's own bound when it gives one above 0, else the model's `MaxOutputTokens` when above 0, else 4096. Never 0
+/// or below, whatever the app declared.
+int OutputBound(int asked, LlmModel model) {
+  if (asked > 0) { return asked; }
+  if (model.MaxOutputTokens > 0) { return model.MaxOutputTokens; }
+  return 4096;
+}
+
+/// Give back what a candidate reserved of the month, when nothing was sent to it.
+void GiveBackOrgTokens(LlmAdmission admission) {
+  if (admission.OrgReserved <= 0) { return; }
+  SettleModelSpend(admission.Opening.Call, 0, null, null, 0, admission.OrgReserved, admission.OrgMonth);
+  admission.OrgReserved = 0;
+}
+
+/// Whether `providerModel` is on the list `allowed` — entries separated by commas or white space, each an exact id or
+/// a prefix ending in `*`. An empty list allows every model. Compared exactly: a model id the list does not spell is
+/// outside it. `osy validate` warns early with a C# twin (OrgPolicyControls.ModelIsOnTheList); the two are held together by
+/// OrgPolicyControlsTests.ModelIsOnTheList_ReadsTheListAsTheLlmKitDoes, which pins this function's text: change both.
+bool ModelIsOnTheList(string allowed, string providerModel) {
+  var entries = allowed.Replace(",", " ").Replace("\t", " ").Replace("\r", " ").Replace("\n", " ").Split(" ")
+    .Where(e => e != "").ToList();
+  if (entries.Count == 0) { return true; }
+  foreach (var entry in entries) {
+    if (entry.EndsWith("*")) {
+      if (providerModel.StartsWith(entry.Substring(0, entry.Length - 1))) { return true; }
+    } else if (entry == providerModel) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// ⭐ THE ORGANISATION'S FLOOR AT ONE CANDIDATE'S ADMISSION. A model outside the list is recorded on the meter as
+/// refused, remembered on the walk and not sent — the walk goes on to the router's next candidate, and refuses when none
+/// inside the list serves (`NoneServed`). Then the call's tokens are reserved against the month (`ReserveOrgTokens`): a
+/// call that could take the month past the ceiling — what it has counted, held calls included, plus this call's prompt
+/// and the most its answer may run to — is recorded and refused at once: every candidate counts toward the same month.
+///
+/// What is asked of the ceiling is the kit's own count, never a number the app's code handed it: the prompt estimated
+/// from the request as it will be sent (`walk.PromptTokens`, counted after the router), at least 0, plus `outTokens`,
+/// at least 1 — the bound the provider is then sent (`OutputBound`).
+///
+/// SECURITY-INVARIANT(llm-the-orgs-model-list-and-token-ceiling-hold-at-admission): every candidate of every
+/// `CompleteWith`, `StreamWith` and `DecideWith` is judged here, AFTER the app's router ordered it and before anything
+/// is sent, against the values `App.Setting<LlmSetup>()` reads — the organisation's, whatever the app assigned — and
+/// its tokens are reserved against the month in the same step, behind the turnstile. Failure mode: an app's router (or a
+/// requested model) reaches a model the organisation's list leaves out, or the app spends past its organisation's
+/// monthly tokens — by a negative or understated bound, by calls fired together, or by streams it walks away from. Do
+/// not judge before the router (it can add nothing, but it orders what is tried) or only on the first candidate, and
+/// never on a number the app's code can set. Guarded by tests/policy.test.osy
+/// `a_locked_model_list_refuses_a_model_outside_it_whatever_the_app_assigns`, `the_apps_router_cannot_route_past_the_list`,
+/// `stream_and_decide_are_held_like_complete`, `the_token_ceiling_refuses_the_call_that_would_pass_it`,
+/// `a_negative_or_understated_output_bound_cannot_pass_the_ceiling`, `calls_started_together_cannot_pass_the_ceiling_between_them`
+/// and `an_abandoned_stream_is_counted_at_its_reservation`.
+internal bool OrgPolicyAdmits(LlmWalk walk, LlmAdmission admission, LlmModel model, int outTokens) {
+  var providerModel = model.ProviderModel();
+  if (!ModelIsOnTheList(AllowedModelsInForce(), providerModel)) {
+    RecordModelCall(admission.Opening, ModelCallOutcome.Refused, 0, 0, 0, 0, 0, 0,
+      $"Your organization's policy does not allow the model '{providerModel}'. Nothing was sent.");
+    walk.Attempt = walk.Attempt + 1;
+    walk.OutsideTheList = walk.OutsideTheList == "" ? providerModel : walk.OutsideTheList + ", " + providerModel;
+    return false;
+  }
+  long prompt = walk.PromptTokens > 0 ? walk.PromptTokens : 0;
+  long answer = outTokens > 1 ? outTokens : 1;
+  long asked = prompt + answer;
+  var reserved = ReserveOrgTokens(asked);
+  if (!reserved.Taken) {
+    RecordModelCall(admission.Opening, ModelCallOutcome.Refused, 0, 0, 0, 0, 0, 0,
+      $"This call could take the month past your organization's ceiling of {reserved.Ceiling} tokens ({reserved.Used} used). Nothing was sent.");
+    walk.Attempt = walk.Attempt + 1;
+    OrgPolicy.Refuse("Osysharp.Llm.LlmSetup.MonthlyTokens", $"{asked} more tokens this month, {reserved.Used} of {reserved.Ceiling} used");
+    return false;
+  }
+  admission.OrgReserved = asked;
+  admission.OrgMonth = reserved.Month;
+  return true;
+}
+
+/// The call is refused: no candidate inside the organisation's model list served it.
+void RefuseOutsideTheList(string models) {
+  OrgPolicy.Refuse("Osysharp.Llm.LlmSetup.AllowedModels", models);
+}

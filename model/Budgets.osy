@@ -87,6 +87,36 @@ public entity LlmAllowance {
   }
 }
 
+/// ⭐ WHAT THE APP'S CALLS HAVE USED OF ITS ORGANISATION'S MONTHLY TOKEN CEILING (`LlmSetup.MonthlyTokens`, ORGPOL OP-FP2):
+/// one row a calendar month (UTC), the tokens every served call reported — prompt, answer and cache, as its provider
+/// counted them, and what calls on their way have reserved (ORGPOL OP-FP2b). Unlike `LlmSpend` it answers to no policy of
+/// the app's: it is written by the kit's reserve/settle pair alone (`ReserveOrgTokens`, `SettleModelSpend`), both
+/// internal, and nothing deletes it — not `ManagesModelSpend`, not `ForgetModelCallRequester` (it names nobody).
+[Unique(Month)]
+public entity LlmOrgUsage {
+  /// The first day of the month (UTC).
+  [Immutable] DateOnly Month;
+  /// Tokens used so far this month, and reserved by calls on their way. Moved only by `+=` in `ReserveOrgTokens` and
+  /// `SettleModelSpend`, one statement relative to the stored row.
+  long Tokens = 0;
+  int Calls = 0;
+
+  security {
+    allow read when UsesModels || ManagesModelSpend || ReadsModelUsage;
+    allow create, update when UsesModels;
+    // SECURITY-INVARIANT(llm-the-months-token-count-is-the-kits-alone): the month's count is created and moved only by
+    // the kit's reserve/settle pair (`ReserveOrgTokens`, `SettleModelSpend`, both internal, so no request can name
+    // them) and is never deleted, so an app cannot lower what its calls have used and spend past its organisation's
+    // ceiling. Failure mode: a delete or an update from app code resets the month to 0. Guarded by tests/policy.test.osy
+    // `the_app_cannot_delete_or_lower_the_months_count` and Platform.Tests
+    // `APackagesInternalFunctionIsNotARequestsToNameTests.NeitherRouteRunsTheKitsTokenReservation`.
+    deny create except via SettleModelSpend, ReserveOrgTokens;
+    deny update Tokens except via SettleModelSpend, ReserveOrgTokens;
+    deny update Calls except via SettleModelSpend;
+    deny delete;
+  }
+}
+
 /// Room held for a call that is on its way: counted against its budget until the call reports back, or until the
 /// hold is older than `LlmSetup.HoldFor` — so a call whose process died does not hold a budget's room for ever.
 /// A hold with neither a `Spend` nor an `Allowance` only counts toward its model's and its key's `MaxConcurrent`.
@@ -413,13 +443,29 @@ internal void NoteBudgetRefusal(Guid budgetId, string subject, DateOnly period) 
 /// scopes would reserve against — in the period it RAN in (`ranAt`), whether or not there was room, because it has
 /// already happened. Over is over, whatever the source: the next ordinary call finds no room and is refused.
 /// Answers, for such a call, the sentence naming each budget it took past its limit ("" when none).
+///
+/// A served call's `tokens` (ORGPOL OP-FP2) are counted in `LlmOrgUsage` — the count an organisation's `MonthlyTokens`
+/// ceiling is judged against — in place of the `reservedTokens` its admission took there in `reservedIn`
+/// (`ReserveOrgTokens`, OP-FP2b): the month moves by the difference. A call that sent nothing settles `tokens` 0 and
+/// gives its reservation back. Only the kit's reserve/settle pair writes it.
 [Server, Authorize(UsesModels), CommitsAlone]
-internal string SettleModelSpend(Guid call, long micros, List<string>? outsideScopes = null, DateTime? ranAt = null) {
+internal string SettleModelSpend(Guid call, long micros, List<string>? outsideScopes = null, DateTime? ranAt = null, long tokens = 0,
+                                 long reservedTokens = 0, DateOnly? reservedIn = null) {
   var outside = outsideScopes != null;
   // A call made somewhere else held nothing: under no budget, there is nothing to count and nobody to wait for.
   List<LlmBudgetFor> budgets = outside ? BudgetsOf(outsideScopes!) : [];
   if (outside && budgets.Count == 0) { return ""; }
   PassTurnstile();
+  long counted = tokens > 0 ? tokens : 0;
+  long reserved = reservedTokens > 0 ? reservedTokens : 0;
+  if (counted > 0 || reserved > 0) {
+    // Behind the turnstile, so two first calls of a month do not both make its row.
+    var month = reservedIn ?? PeriodOf(LlmBudgetWindow.Month, DateTime.UtcNow);
+    var usage = LlmOrgUsage.FirstOrDefault(u => u.Month == month);
+    if (usage == null) { usage = new LlmOrgUsage { Month = month }; }
+    if (counted != reserved) { usage.Tokens += counted - reserved; }
+    if (counted > 0) { usage.Calls += 1; }
+  }
   List<LlmSpend> spends = [];
   foreach (var hold in LlmHold.Where(h => h.Call == call).ToList()) {
     if (hold.Spend != null) { spends.Add(hold.Spend!); }

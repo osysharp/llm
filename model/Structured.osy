@@ -131,7 +131,12 @@ public LlmDecided DecideWith(LlmDecisionRequest decision, LlmCall call) {
     if (!decides && !ChatsOn(model, key)) { continue; }
 
     // A decision's answer is small: a value and a number — smaller still from a model built for it.
-    var admission = KeyedAdmit(walk, ModelCallKind.Decide, name, model, facts, route, call, decides ? 64 : 512, key);
+    // The kit's own count of what is sent (ORGPOL OP-FP2b): the decision as asked, or the chat request that stands in.
+    var outTokens = decides ? 64 : 512;
+    walk.PromptTokens = decides
+      ? (decision.Question.Length + decision.Input.Length + decision.SchemaJson.Length + 3) / 4
+      : EstimateTokens(chat);
+    var admission = KeyedAdmit(walk, ModelCallKind.Decide, name, model, facts, route, call, outTokens, key);
     if (admission.Refused.Refusal == LlmHoldRefusal.OverBudget) {
       route = KeyedStepDownOrStop(walk, admission.Refused, facts, key);
       index = 0;
@@ -147,6 +152,7 @@ public LlmDecided DecideWith(LlmDecisionRequest decision, LlmCall call) {
         made = EveryModelIsScripted() ? ScriptedDecision(name, decision) : DeciderOn(model, key).Decide(decision);
       } else {
         chat.Model = model.ProviderModel();
+        chat.MaxTokens = outTokens;
         var response = EveryModelIsScripted() ? ScriptedAnswer(name, chat) : ClientOn(model, key).Complete(chat);
         made = DecisionFrom(response);
       }

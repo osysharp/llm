@@ -14,6 +14,10 @@ app.Llm = new LlmSetup {
                    Price = new LlmPrice { Input = 0.05m, Output = 0 } },
     new LlmModel { Name = "Narrow", Client = new ScriptedModel { Name = "Narrow" }, Model = "scripted-narrow",
                    Price = new LlmPrice { Input = 1, Output = 5 }, MaxOutputTokens = 1000, MaxConcurrent = 2 },
+    // A model whose declared most output is below nothing (ORGPOL OP-FP2b): the organisation's ceiling must not be
+    // read off it.
+    new LlmModel { Name = "Liar", Client = new ScriptedModel { Name = "Liar" }, Model = "scripted-liar",
+                   Price = new LlmPrice { Input = 1, Output = 5 }, MaxOutputTokens = -1000000 },
   ],
   Default = "Small",
   Router = new SeedBankRouter(),

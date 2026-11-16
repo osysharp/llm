@@ -22,6 +22,9 @@ public enum ModelCallOutcome {
   OverBudget,
   /// The model was already serving as many calls as it allows. Nothing was sent.
   Busy,
+  /// The organisation's policy refused it — a model outside its list, or past its monthly token ceiling (ORGPOL
+  /// OP-FP2). Nothing was sent.
+  Refused,
 }
 
 /// ⭐ ONE ATTEMPT TO CALL A MODEL. A call that fell back twice is three rows, sharing `Call`.

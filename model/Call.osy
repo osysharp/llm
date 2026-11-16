@@ -282,6 +282,9 @@ public int EstimateTokens(LlmRequest request) {
       chars = chars + (b.Text ?? "").Length + (b.InputJson ?? "").Length + (b.ResultJson ?? "").Length;
       // An image is priced by its size, not its bytes; a flat allowance keeps the estimate from reading as zero.
       if (b.Kind == LlmBlockKind.Image) { chars = chars + 6000; }
+      // A PDF is read page by page, as text and as a picture of each page: the same flat allowance, and a token for
+      // every six bytes of the file on top (half its base64) — so a document of many pages is never read as free.
+      if (b.Kind == LlmBlockKind.Document) { chars = chars + 6000 + (b.DataBase64 ?? "").Length / 2; }
     }
   }
   foreach (var t in request.Tools) { chars = chars + t.Name.Length + t.Description.Length + t.InputSchemaJson.Length; }
@@ -409,6 +412,12 @@ class LlmWalk {
   public string Problem = "";
   /// A budget has already said to step down once; a second refusal stops.
   public bool SteppedDown = false;
+  /// The provider models the organisation's list kept from this call (ORGPOL OP-FP2), one line each — what the
+  /// refusal names when no candidate inside the list served.
+  public string OutsideTheList = "";
+  /// The prompt of the candidate being admitted, as the kit counts it from the request it will send — counted after the
+  /// router ran, never read off the facts the router was handed (ORGPOL OP-FP2b).
+  public int PromptTokens = 0;
 }
 
 /// Whether one candidate may be called, and the record its attempt is written from.
@@ -420,6 +429,10 @@ class LlmAdmission {
   public LlmPricePoint Price = new LlmPricePoint();
   /// The budget that refused, when one did.
   public LlmHoldResult Refused = new LlmHoldResult();
+  /// The tokens reserved for it against the organisation's month (ORGPOL OP-FP2b), and the month — settled when it is
+  /// answered, given back when nothing was sent, kept when its stream is walked away from.
+  public long OrgReserved = 0;
+  public DateOnly? OrgMonth;
 }
 
 /// The router's answer for these facts, or the refusal when it admits nothing.
@@ -439,7 +452,7 @@ LlmRoutingDecision RouteOrRefuse(LlmTaskFacts facts) { return KeyedRouteOrRefuse
 internal LlmAdmission KeyedAdmit(LlmWalk walk, ModelCallKind kind, string name, LlmModel model, LlmTaskFacts facts,
                    LlmRoutingDecision route, LlmCall call, int outTokens, LlmKey? key) {
   var price = PriceOf(name);
-  var estimate = CostMicros(price, facts.InputTokens, outTokens, 0, 0);
+  var estimate = CostMicros(price, walk.PromptTokens > 0 ? walk.PromptTokens : 0, outTokens, 0, 0);
   var scopes = KeyedScopesOf(call, name, key);
   var keyId = key == null ? "" : key!.IdOf();
   var admission = new LlmAdmission { Price = price };
@@ -451,7 +464,12 @@ internal LlmAdmission KeyedAdmit(LlmWalk walk, ModelCallKind kind, string name, 
     Account = keyId,
   };
 
+  // The organisation's floor (ORGPOL OP-FP2), judged here — after the app's router, for each candidate it ordered, in
+  // all three walks (Complete, Stream, Decide) — before any budget of the app's and before anything is sent.
+  if (!OrgPolicyAdmits(walk, admission, model, outTokens)) { return admission; }
+
   if (facts.MaxCostMicros != null && estimate > facts.MaxCostMicros!) {
+    GiveBackOrgTokens(admission);
     RecordModelCall(admission.Opening, ModelCallOutcome.OverBudget, 0, 0, 0, 0, 0, 0,
       $"It could cost ${Dollars(estimate)}, and this call may spend ${Dollars(facts.MaxCostMicros!)}.");
     walk.Attempt = walk.Attempt + 1;
@@ -465,6 +483,7 @@ internal LlmAdmission KeyedAdmit(LlmWalk walk, ModelCallKind kind, string name, 
     admission.Held = hold.Held;
     return admission;
   }
+  GiveBackOrgTokens(admission);
   RecordModelCall(admission.Opening, hold.Refusal == LlmHoldRefusal.Busy ? ModelCallOutcome.Busy : ModelCallOutcome.OverBudget,
     0, 0, 0, 0, 0, 0, hold.Why);
   walk.Attempt = walk.Attempt + 1;
@@ -507,11 +526,19 @@ LlmRoutingDecision StepDownOrStop(LlmWalk walk, LlmHoldResult refused, LlmTaskFa
 }
 
 /// The provider answered: settle what was held at what it actually cost, and write the attempt's meter row.
-/// Answers the cost.
+/// Answers the cost. `reported` is false when the provider's counts never came (a stream without its closing event):
+/// the month then keeps what was reserved for the call.
 long Served(LlmAdmission admission, int inputTokens, int outputTokens, int cacheReadTokens, int cacheWriteTokens,
-            DateTime started, string? note) {
+            DateTime started, string? note, bool reported = true) {
   var cost = CostMicros(admission.Price, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens);
-  if (admission.Held) { SettleModelSpend(admission.Opening.Call, cost); }
+  // Every token the provider reported counts toward the month an organisation's ceiling is judged on (OP-FP2), held
+  // or not — settled against what was reserved for it (OP-FP2b).
+  var tokens = (long)inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens;
+  if (tokens < 0) { tokens = 0; }
+  if (!reported) { tokens = admission.OrgReserved; }
+  if (admission.Held || tokens > 0 || admission.OrgReserved > 0) {
+    SettleModelSpend(admission.Opening.Call, cost, null, null, tokens, admission.OrgReserved, admission.OrgMonth);
+  }
   // The host's own count of AI work across everything it serves — the tokens and what they cost, which is what the
   // console's usage page shows an application's owner. A measurement, bounded by nothing.
   Ai.CountGeneration(inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens, cost);
@@ -521,8 +548,11 @@ long Served(LlmAdmission admission, int inputTokens, int outputTokens, int cache
 }
 
 /// The provider failed: release what was held, write the attempt's meter row, and remember it for the next candidate.
-void Failed(LlmWalk walk, LlmAdmission admission, DateTime started, string said) {
-  if (admission.Held) { SettleModelSpend(admission.Opening.Call, 0); }
+/// What was reserved of the organisation's month is given back — unless `began`: a stream that failed part-way had
+/// already been answered in part, and keeps its reservation.
+void Failed(LlmWalk walk, LlmAdmission admission, DateTime started, string said, bool began = false) {
+  var giveBack = began ? 0 : admission.OrgReserved;
+  if (admission.Held || giveBack > 0) { SettleModelSpend(admission.Opening.Call, 0, null, null, 0, giveBack, admission.OrgMonth); }
   RecordModelCall(admission.Opening, ModelCallOutcome.Failed, 0, 0, 0, 0, 0, MillisSince(started), said);
   walk.FailedBefore = admission.Opening.Model;
   walk.Problem = said;
@@ -532,6 +562,8 @@ void Failed(LlmWalk walk, LlmAdmission admission, DateTime started, string said)
 /// No candidate served: fail as the last provider failed, or refuse.
 void NoneServed(LlmWalk walk) {
   if (walk.FailedBefore != null) { throw new ExternalServiceException(walk.Problem); }
+  // Nothing was sent, and the organisation's list kept a candidate from it: the organisation's refusal.
+  if (walk.OutsideTheList != "") { RefuseOutsideTheList(walk.OutsideTheList); }
   if (walk.Problem != "") { throw new LlmBusy(walk.Problem); }
   throw new LlmRouteDenied("No model this app's routing admits for this call can serve it.");
 }
@@ -560,7 +592,11 @@ public LlmResult CompleteWith(LlmRequest request, LlmCall call) {
     var model = ModelNamed(name);
     if (!ChatsOn(model, key)) { continue; }
 
-    var admission = KeyedAdmit(walk, ModelCallKind.Complete, name, model, facts, route, call, maxOut > 0 ? maxOut : model.MaxOutputTokens, key);
+    // The ceiling is asked for the kit's own count, made here from the request as it will be sent, and the provider is
+    // sent no bigger bound than the one checked (ORGPOL OP-FP2b).
+    var outTokens = OutputBound(maxOut, model);
+    walk.PromptTokens = EstimateTokens(request);
+    var admission = KeyedAdmit(walk, ModelCallKind.Complete, name, model, facts, route, call, outTokens, key);
     if (admission.Refused.Refusal == LlmHoldRefusal.OverBudget) {
       route = KeyedStepDownOrStop(walk, admission.Refused, facts, key);
       index = 0;
@@ -572,6 +608,7 @@ public LlmResult CompleteWith(LlmRequest request, LlmCall call) {
     LlmResponse? response = null;
     try {
       request.Model = model.ProviderModel();
+      request.MaxTokens = outTokens;
       response = EveryModelIsScripted() ? ScriptedAnswer(name, request) : ClientOn(model, key).Complete(request);
     } catch (ExternalServiceException e) {
       // The provider failed or refused (an outage, a rate limit, an overload): on to the router's next candidate —

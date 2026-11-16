@@ -260,6 +260,38 @@ takes a person off every row and deletes what was counted against a budget of th
 stay. With [`Osysharp.Privacy`](../privacy) in the app, [`Osysharp.Privacy.Llm`](../privacy-llm) does it when the
 person asks and when the period ends.
 
+## Your organization's floor
+
+Two settings of `LlmSetup` are your organization's to govern (2.12.0). What your code and the kit read is the
+organization's value, whatever `app.Llm` assigns:
+
+- `AllowedModels` (a lock): the provider models a call may be sent to, separated by commas or spaces — an exact id
+  (`claude-haiku-4-5`) or a prefix ending in `*` (`claude-haiku-*`). Empty: any model. A candidate outside it is never
+  sent, whatever your router ordered; the walk goes on to the next one, and a call none inside the list served is
+  refused (`PolicyRefused`, key `Osysharp.Llm.LlmSetup.AllowedModels`).
+- `MonthlyTokens` (a range): the most tokens your calls may use in a calendar month (UTC) — prompt, answer and cache, as
+  the provider reports them. Each call reserves its prompt (as the kit counts it from the request it sends) and the most
+  its answer may run to (the call's `MaxTokens`, else the model's `MaxOutputTokens`, else 4096 — and that bound is what
+  the provider is sent). A call whose reservation would take the month past the ceiling, counting the calls still on
+  their way, is refused before anything is sent (`PolicyRefused`, key `Osysharp.Llm.LlmSetup.MonthlyTokens`). An
+  answered call is then counted at the provider's own numbers; a call that sent nothing gives its reservation back; a
+  stream you stop reading keeps it. The month's count is `LlmOrgUsage`: only the kit's reserve and settle write it, and
+  nothing deletes it.
+
+Each refusal is on the meter too, outcome `Refused`. Read `osy policy` before naming a model.
+
+| | |
+|---|---|
+| A model outside the list is refused, whatever the app assigns | `a_locked_model_list_refuses_a_model_outside_it_whatever_the_app_assigns` |
+| The app's router cannot route past the list | `the_apps_router_cannot_route_past_the_list` |
+| A streamed call and a decision are held the same way | `stream_and_decide_are_held_like_complete` |
+| The call that would pass the month's ceiling is refused | `the_token_ceiling_refuses_the_call_that_would_pass_it` |
+| The month's count cannot be deleted or lowered by the app | `the_app_cannot_delete_or_lower_the_months_count` |
+| An app's own value of 0 is held inside the organization's range | `an_app_value_of_zero_is_held_inside_the_range` |
+| A negative or understated output bound cannot pass the ceiling | `a_negative_or_understated_output_bound_cannot_pass_the_ceiling` |
+| Calls started together cannot pass the ceiling between them | `calls_started_together_cannot_pass_the_ceiling_between_them` |
+| A stream you stop reading is counted at its reservation | `an_abandoned_stream_is_counted_at_its_reservation` |
+
 ## Its tests
 
 `kits/llm/tests` is a seed bank that reads the notes growers send in with their seed: 51 tests over three scripted

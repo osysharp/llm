@@ -28,7 +28,10 @@ public stream<LlmStreamEvent> StreamWith(LlmRequest request, LlmCall call) {
     var model = ModelNamed(name);
     if (!ChatsOn(model, key)) { continue; }
 
-    var admission = KeyedAdmit(walk, ModelCallKind.Stream, name, model, facts, route, call, maxOut > 0 ? maxOut : model.MaxOutputTokens, key);
+    // The kit's own count, as `CompleteWith` makes it (ORGPOL OP-FP2b).
+    var outTokens = OutputBound(maxOut, model);
+    walk.PromptTokens = EstimateTokens(request);
+    var admission = KeyedAdmit(walk, ModelCallKind.Stream, name, model, facts, route, call, outTokens, key);
     if (admission.Refused.Refusal == LlmHoldRefusal.OverBudget) {
       route = KeyedStepDownOrStop(walk, admission.Refused, facts, key);
       index = 0;
@@ -45,6 +48,9 @@ public stream<LlmStreamEvent> StreamWith(LlmRequest request, LlmCall call) {
     var cacheWrite = 0;
     LlmStreamEvent? closing = null;
     request.Model = model.ProviderModel();
+    request.MaxTokens = outTokens;
+    // From here the call counts at least what it reserved: a reader that walks away part-way leaves it reserved — the
+    // provider has been asked, and has counted what it sent (ORGPOL OP-FP2b).
     try {
       foreach (var e in KeyedStreamOf(model, name, request, key)) {
         began = true;
@@ -62,15 +68,15 @@ public stream<LlmStreamEvent> StreamWith(LlmRequest request, LlmCall call) {
       }
       served = true;
     } catch (ExternalServiceException e) {
-      Failed(walk, admission, started, e.Message);
+      Failed(walk, admission, started, e.Message, began);
       if (began) { throw; }
     } catch (Exception e) {
-      Failed(walk, admission, started, e.Message);
+      Failed(walk, admission, started, e.Message, began);
       throw;
     }
     if (served) {
       var cost = Served(admission, inputTokens, outputTokens, cacheRead, cacheWrite, started,
-        complete ? null : "The stream ended without its closing event, so it reported no usage.");
+        complete ? null : "The stream ended without its closing event, so it reported no usage.", complete);
       if (closing != null) {
         closing!.Model = name;
         closing!.RouteRule = route.RuleId;
