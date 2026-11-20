@@ -577,6 +577,7 @@ void NoneServed(LlmWalk walk) {
 /// `Llm.Complete(request, call)` is this function. It is top-level so a test can answer for it whole:
 /// `CompleteWith.Stub((request, call) => new LlmResult { … });`.
 public LlmResult CompleteWith(LlmRequest request, LlmCall call) {
+  RequireToolsFromTheAgentsKit(request);
   RequireGeneration();
   var key = KeyFor(call);
   var walk = new LlmWalk { Call = Guid.NewGuid() };

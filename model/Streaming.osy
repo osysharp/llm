@@ -10,6 +10,7 @@ namespace Osysharp.Llm;
 ///
 /// `Llm.Stream(request, call)` is this function.
 public stream<LlmStreamEvent> StreamWith(LlmRequest request, LlmCall call) {
+  RequireToolsFromTheAgentsKit(request);
   RequireGeneration();
   var key = KeyFor(call);
   var walk = new LlmWalk { Call = Guid.NewGuid() };

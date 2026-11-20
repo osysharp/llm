@@ -3,6 +3,6 @@
 app SeedBank {
   model "model/**/*.osy";
   tests "**/*.test.osy";
-  use Osysharp.Llm@2;
+  use Osysharp.Llm@3;
   use Osysharp.Workflow;
 }

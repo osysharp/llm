@@ -260,3 +260,51 @@ void a_document_is_estimated_by_its_size() {
   Assert.True(small >= 1500);
   Assert.True(large >= small + 10000);
 }
+
+// ── a tool loop of the app's own (ORGPOL OP-FP3b-2): `LlmSetup.ToolsOnlyThroughAgents`, a lock ─────────────────────
+
+/// What the app's `catch` is handed when the organisation's lock refuses a request with tools.
+string ToolsRefusal() {
+  return "PolicyRefused|This app tried to use the setting `Osysharp.Llm.LlmSetup.ToolsOnlyThroughAgents` in a way "
+    + "your organization's policy does not allow.";
+}
+
+/// Under the lock, the bank's own code asking a model with a tool is refused before anything is sent — a plain call and a
+/// streamed one. Only `Osysharp.Agents`'s own code asks with tools (the agents kit's test
+/// `the_kits_own_loop_runs_its_tools_under_the_lock`).
+[Test(Bank)]
+[runas(Ines)]
+void a_tool_request_from_app_code_is_refused_under_lock() {
+  ScriptedAnswer.Stub((model, request) => {
+    new Heard { What = "asked", About = model };
+    return Scripted.Text("The top drawer.", 100, 20);
+  });
+  Assert.False(App.Setting<LlmSetup>().ToolsOnlyThroughAgents);
+  ToolsOnlyThroughAgentsInForce.Stub(() => true);
+  Assert.Equal(ToolsRefusal(), DrawerAnswerOrRefusal(true));
+  Assert.Equal(ToolsRefusal(), StreamedDrawerOrRefusal(true));
+  Assert.Equal(0, Heard.Count(h => h.What == "asked"));
+  Assert.Equal(0, ModelCall.Count());
+}
+
+/// A request without tools is never judged by the lock.
+[Test(Bank)]
+[runas(Ines)]
+void a_request_without_tools_is_always_served() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("The top drawer.", 100, 20));
+  ToolsOnlyThroughAgentsInForce.Stub(() => true);
+  Assert.Equal("The top drawer.", DrawerAnswerOrRefusal(false));
+  Assert.Equal("The top drawer.", StreamedDrawerOrRefusal(false));
+}
+
+/// The lock off (the kit's default): the bank's own tool request is served, as before.
+[Test(Bank)]
+[runas(Ines)]
+void a_tool_request_is_served_when_the_lock_is_off() {
+  ScriptedAnswer.Stub((model, request) => {
+    Assert.Equal(1, request.Tools.Count);
+    return Scripted.Text("The top drawer.", 100, 20);
+  });
+  Assert.Equal("The top drawer.", DrawerAnswerOrRefusal(true));
+  Assert.Equal("The top drawer.", StreamedDrawerOrRefusal(true));
+}

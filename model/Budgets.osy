@@ -54,7 +54,12 @@ public entity LlmSpend {
   bool Warned = false;
 
   security {
-    allow read when UsesModels || ManagesModelSpend || ReadsModelUsage;
+    // SECURITY-INVARIANT(a-kits-bookkeeping-is-read-only-by-its-own-functions): read by whoever reads or manages model
+    // spend, and past that only by the kit's own functions that keep it (`allow read via`) — never by every caller who
+    // may call a model. Failure mode: any signed-in caller reads another person's spend. Guarded by tests/budgets.test.osy
+    // `a_caller_reads_nobodys_bookkeeping_and_a_reservation_still_counts_it`.
+    allow read when ManagesModelSpend || ReadsModelUsage;
+    allow read via HoldModelSpend, NoteBudgetRefusal, SettleModelSpend;
     allow create, update when UsesModels;
     deny create except via HoldModelSpend, NoteBudgetRefusal, SettleModelSpend;
     deny update SpentMicros, Calls, Warned, OutsideMicros except via SettleModelSpend;
@@ -79,7 +84,11 @@ public entity LlmAllowance {
   int Calls = 0;
 
   security {
-    allow read when UsesModels || ManagesModelSpend || ReadsModelUsage;
+    // Read by whoever reads or manages model spend; past that by the reservation and settlement that keep it, and by
+    // `SpentAgainst`, which answers what one scope's limit has spent — a figure, never a row — to the code that holds
+    // work to that limit as its caller (what a piece of work has left for what it hands on).
+    allow read when ManagesModelSpend || ReadsModelUsage;
+    allow read via HoldModelSpend, SettleModelSpend, SpentAgainst;
     allow create, update when UsesModels;
     deny create except via HoldModelSpend;
     deny update SpentMicros, Calls except via SettleModelSpend;
@@ -102,7 +111,8 @@ public entity LlmOrgUsage {
   int Calls = 0;
 
   security {
-    allow read when UsesModels || ManagesModelSpend || ReadsModelUsage;
+    allow read when ManagesModelSpend || ReadsModelUsage;
+    allow read via ReserveOrgTokens, SettleModelSpend;
     allow create, update when UsesModels;
     // SECURITY-INVARIANT(llm-the-months-token-count-is-the-kits-alone): the month's count is created and moved only by
     // the kit's reserve/settle pair (`ReserveOrgTokens`, `SettleModelSpend`, both internal, so no request can name
@@ -131,7 +141,10 @@ public entity LlmHold {
   [Immutable] DateTime At = DateTime.UtcNow;
 
   security {
-    allow read, create, delete when UsesModels;
+    // Every caller's holds are counted by the reservation, and read by nobody else: whose calls are in flight is spend.
+    allow read when ManagesModelSpend || ReadsModelUsage;
+    allow read via HoldModelSpend, SettleModelSpend;
+    allow create, delete when UsesModels;
     deny create except via HoldModelSpend;
     deny delete except via SettleModelSpend, HoldModelSpend;
   }
@@ -139,12 +152,25 @@ public entity LlmHold {
 
 /// The turnstile: reservations and settlements pass it one at a time, each holding it until its own commit, so two
 /// calls reserving at the same moment cannot both take the last of a budget's room — the second reads what the first
-/// left. It holds nothing worth protecting: writing it by hand only waits one's turn.
+/// left. Made and moved only by `PassTurnstile`.
 public entity LlmTurnstile {
-  [Unique, MaxLength(40)] string Name;
+  [Unique, Immutable, MaxLength(40)] string Name;
   long Turn = 0;
 
-  security { allow read, create, update when UsesModels; }
+  security {
+    // Read past the caller only by `PassTurnstile`, whose one statement selects the row through its read mark.
+    allow read when ManagesModelSpend || ReadsModelUsage;
+    allow read via PassTurnstile;
+    allow create, update when UsesModels;
+    // SECURITY-INVARIANT(a-kits-throttle-is-written-only-by-the-kit): the turnstile is made and moved only by the kit's
+    // `PassTurnstile` (internal, so no request can name it), never by a request — a client, REST or MCP write, or
+    // another function of the app or the kit. Failure mode: a caller who may call a model holds the row in a write of
+    // their own, or makes rows of their own, and every reservation waits on them. Guarded by tests/budgets.test.osy
+    // `a_signed_in_caller_cannot_make_or_move_the_turnstile` and Platform.Tests
+    // `KitWritePathTests.AnExceptVia_PassesTheNamedFunctionsOwnSetBasedStatement_AndNoOneElses`.
+    deny create except via PassTurnstile;
+    deny update Turn except via PassTurnstile;
+  }
 }
 
 /// A budget has passed its warning share for this period. Raised once per budget, subject and period.
@@ -258,8 +284,10 @@ class LlmBudgetFor {
 }
 
 /// Wait this call's turn at the turnstile, and hold it until this unit of work commits. One statement: the database
-/// queues the callers, so nobody retries.
-void PassTurnstile() {
+/// queues the callers, so nobody retries. The only code that makes or moves the turnstile; every reservation and
+/// settlement calls it, so whoever may call a model may pass.
+[Server, Authorize(UsesModels)]
+internal void PassTurnstile() {
   var passed = LlmTurnstile.Where(t => t.Name == "spend").Update(t => { t.Turn = t.Turn + 1; });
   if (passed > 0) { return; }
   // The very first call of an app builds the turnstile; two that race to are settled by its declared [Unique].
@@ -402,7 +430,12 @@ string LimitSentence(string scope, LlmBudgetWindow window, long limitMicros) {
 
 /// What the calls that carried a limit for `scope` have spent against it this `window`, in US dollars — settled calls
 /// only. `SpentAgainst("task:" + task.Id)` is what a piece of work has used of its own limit.
+///
+/// It answers whoever may call a model or reads or manages the spend, as the caller — the code that holds work to a
+/// limit asks it as the person the work is for — while that caller reads no row of the count (`LlmAllowance` names it
+/// in `allow read via`). Anybody else is told 0.
 public decimal SpentAgainst(string scope, LlmBudgetWindow window = LlmBudgetWindow.Total) {
+  if (!(UsesModels || ManagesModelSpend || ReadsModelUsage)) { return 0m; }
   var line = ScopeLine(scope);
   var period = PeriodOf(window, DateTime.UtcNow);
   // Summed where it is stored, never read as a row: a call settles in a unit of work of its own, and a row this

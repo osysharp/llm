@@ -374,6 +374,40 @@ void budgets_are_set_only_by_who_manages_the_spend_and_only_through_the_kit() {
   }
 }
 
+// A caller who may call a model reads nobody's holds, spend or turnstile — and the reservation, which runs as
+// that caller, still counts what everyone has spent: the app budget Ines used up refuses Omar's call.
+[Test(Bank)]
+void a_caller_reads_nobodys_bookkeeping_and_a_reservation_still_counts_it() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("A line.", 1000, 200));
+  runas (Tove) { SetBudget("app", "", LlmBudgetWindow.Day, 0.006m); UnitOfWork.Commit(); }
+  runas (Ines) { Summarise("beans"); }
+  runas (Omar) {
+    Assert.Equal(0, LlmSpend.Count());
+    Assert.Equal(0, LlmHold.Count());
+    Assert.Equal(0, LlmTurnstile.Count());
+    Assert.Throws<LlmBudgetExceeded>(() => Summarise("beans"));
+  }
+  runas (Ines) {
+    var spend = LlmSpend.Single();
+    Assert.Equal(2000, spend.SpentMicros);
+    Assert.Equal(1, spend.Refused);
+  }
+}
+
+/// What a limit has spent is a figure the code holding work to it asks for as its caller: a keeper who reads nobody's
+/// spend reads no row of the count, and `SpentAgainst` still answers what the limit has spent. Somebody kept away from
+/// the models is told nothing.
+[Test(Bank)]
+void a_caller_who_reads_no_spend_is_told_what_a_limit_has_spent() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("A line.", 1000, 200));
+  runas (Omar) {
+    SummariseWithin("B2", 10000, "beans");
+    Assert.Equal(0, LlmAllowance.Count());
+    Assert.Equal(0.002m, SpentAgainst("lot:B2"));
+  }
+  runas (Rut) { Assert.Equal(0m, SpentAgainst("lot:B2")); }
+}
+
 [Test(Bank)]
 void what_a_budget_has_counted_is_changed_only_by_the_call_path() {
   ScriptedAnswer.Stub((model, request) => Scripted.Text("A line.", 1000, 200));
@@ -487,4 +521,33 @@ void a_key_at_its_concurrent_cap_refuses_the_call_and_never_moves_it_to_another_
     Assert.Equal(8, ModelCall.Count(c => c.Account == "members"));
     Assert.Equal(0, LlmHold.Count());
   }
+}
+
+// ── the turnstile is the kit's ──────────────────────────────────────────────────────────────────────────────────────
+
+void MakeATurnstile() { new LlmTurnstile { Name = "mine" }; }
+void ResetTheTurnstile() { LlmTurnstile.Single(t => t.Name == "spend").Turn = 0; }
+int ResetTheTurnstileAtOnce() => LlmTurnstile.Where(t => t.Name == "spend").Update(t => { t.Turn = 0; });
+
+[Test(Bank)]
+void a_signed_in_caller_cannot_make_or_move_the_turnstile() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("A line.", 1000, 200));
+  runas (Tove) { SetBudget("app", "", LlmBudgetWindow.Day, 1m); UnitOfWork.Commit(); }
+  // A call under a budget passes the turnstile, which the kit makes on the app's first call.
+  runas (Ines) { Summarise("beans"); }
+  runas (Ines) {
+    var turn = LlmTurnstile.Single(t => t.Name == "spend").Turn;
+    Assert.True(turn > 0);
+    // Nobody makes one of their own, or moves the kit's — row by row or in one statement.
+    Assert.Denied(() => MakeATurnstile());
+    UnitOfWork.Discard();
+    Assert.Denied(() => ResetTheTurnstile());
+    UnitOfWork.Discard();
+    Assert.Equal(0, ResetTheTurnstileAtOnce());
+    UnitOfWork.Commit();
+    Assert.Equal(turn, LlmTurnstile.Single(t => t.Name == "spend").Turn);
+    Assert.Equal(1, LlmTurnstile.Count());
+  }
+  // The treasurer, who manages the spend, does not either.
+  runas (Tove) { Assert.Denied(() => ResetTheTurnstile()); UnitOfWork.Discard(); }
 }

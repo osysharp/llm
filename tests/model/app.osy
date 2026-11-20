@@ -340,3 +340,33 @@ void ForgePrice() {
 
 /// A meter row given to nobody by hand.
 void RewriteWhoAsked(ModelCall row) { row.Requester = null; }
+
+// ── a tool loop of the bank's own (ORGPOL OP-FP3b-2) ──────────────────────────────────────────────────────────────
+
+/// A request that offers the model one tool — what the bank's own tool loop would send — or none.
+LlmRequest DrawerRequest(bool withTool) {
+  var request = RequestOf("Which drawer holds the beans?");
+  if (withTool) {
+    request.Tools = [new LlmToolDefinition { Name = "open_drawer", Description = "Opens a drawer.", InputSchemaJson = "{\"type\":\"object\"}" }];
+  }
+  return request;
+}
+
+/// The bank's own code asks a model with a tool (or without), and says what came back or what was refused.
+[SuppressWarning("observability-catch-without-log")]
+string DrawerAnswerOrRefusal(bool withTool) {
+  try { return (await Llm.Complete(DrawerRequest(withTool), new LlmCall())).Text(); }
+  catch (Exception e) { return e.Type + "|" + e.Message; }
+}
+
+/// The same, streamed.
+[SuppressWarning("observability-catch-without-log")]
+string StreamedDrawerOrRefusal(bool withTool) {
+  try {
+    var words = "";
+    await foreach (var e in Llm.Stream(DrawerRequest(withTool), new LlmCall())) {
+      if (e.Kind == LlmStreamEventKind.TextDelta) { words = words + (e.Delta ?? ""); }
+    }
+    return words;
+  } catch (Exception e) { return e.Type + "|" + e.Message; }
+}

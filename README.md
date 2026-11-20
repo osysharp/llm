@@ -8,7 +8,7 @@ sent, the provider is called, the next model is tried when one fails, and a mete
 priced from your own price book, in millionths of a dollar.
 
 ```osy
-use Osysharp.Llm@2;
+use Osysharp.Llm@3;
 use Osysharp.Models.Anthropic@1 { egress "api.anthropic.com"; }
 
 app.Secrets = [ new Secret("Anthropic") ];
@@ -251,9 +251,15 @@ Each of these is a test in the kit's test app:
 | The meter is read only by who the app says | `a_call_is_recorded_for_who_it_ran_for_and_read_only_by_who_the_app_says` |
 | A person is taken off the meter only by who manages the spend, through `ForgetModelCallRequester`, and what their calls cost stays counted | `a_person_is_taken_off_the_meter_and_what_their_calls_cost_stays_counted`, `only_whoever_manages_spend_takes_a_person_off_the_meter_and_only_through_the_kit` |
 
-Anyone who may call a model can read the budgets and what each has counted; the per-call detail is the meter's, and
-`ReadsModelUsage` decides who reads that — with whoever manages the spend, who deletes old rows and takes a person
-off them.
+Anyone who may call a model can read the budgets themselves. What each has counted (`LlmSpend`, `LlmAllowance`, the
+month's `LlmOrgUsage`), the holds of calls in flight (`LlmHold`) and the turnstile are read by whoever
+`ReadsModelUsage` or `ManagesModelSpend` admits, and past them only by the kit's own reservation, settlement and
+turnstile functions (`allow read via`), which run as the caller and count every caller's rows — so a signed-in caller
+reads nobody's holds or spend, and `SpentIn` answers for those readers. `SpentAgainst` reads the limits' counts the
+same way: the code that holds work to a limit asks it as the person the work is for, so it answers anyone who may call
+a model — a figure for the scope it is asked about, never a row. The per-call detail is the
+meter's, and `ReadsModelUsage` decides who reads that — with whoever manages the spend, who deletes old rows and takes
+a person off them.
 
 **The meter keeps no text of a call, and it does say who the call was for.** `ForgetModelCallRequester(person)`
 takes a person off every row and deletes what was counted against a budget of their own; the rows and their cost
@@ -262,7 +268,7 @@ person asks and when the period ends.
 
 ## Your organization's floor
 
-Two settings of `LlmSetup` are your organization's to govern (2.12.0). What your code and the kit read is the
+Three settings of `LlmSetup` are your organization's to govern. What your code and the kit read is the
 organization's value, whatever `app.Llm` assigns:
 
 - `AllowedModels` (a lock): the provider models a call may be sent to, separated by commas or spaces — an exact id
@@ -277,6 +283,14 @@ organization's value, whatever `app.Llm` assigns:
   answered call is then counted at the provider's own numbers; a call that sent nothing gives its reservation back; a
   stream you stop reading keeps it. The month's count is `LlmOrgUsage`: only the kit's reserve and settle write it, and
   nothing deletes it.
+- `ToolsOnlyThroughAgents` (a lock, off until the organization locks it on): a model request that carries tools
+  (`LlmRequest.Tools` not empty) is refused (`PolicyRefused`, key `Osysharp.Llm.LlmSetup.ToolsOnlyThroughAgents`) before
+  anything is routed, reserved or sent, unless the code that called this kit is `Osysharp.Agents`'s own — read by the
+  platform off the running code (`OrgPolicy.CallerIs("Osysharp.Agents")`). Your own code, another package, and your code
+  the agents kit calls back into (an `Agent`/`Skill` override, a tool body, a guard) are refused, also from a stream or
+  task that code opens. So an app cannot run its own tool loop through a model: it gives the work to an agent
+  (`Agents.Of<T>().Do(skill, input)`). A request without tools is never judged; a typed answer (`Llm.Extract`,
+  `Llm.Decide`) is not refused; pair the lock with the egress rule that leaves the provider's host to its kit.
 
 Each refusal is on the meter too, outcome `Refused`. Read `osy policy` before naming a model.
 
@@ -305,7 +319,7 @@ osy test kits/llm/tests
 
 ## Source and package
 
-- Package: `Osysharp.Llm` — `use Osysharp.Llm@2;`
+- Package: `Osysharp.Llm` — `use Osysharp.Llm@3;`
 - Source: [`kits/llm`](.) — `model/Contract.osy` (providers), `Routing.osy`, `Setup.osy`, `Call.osy` (the call path),
   `Streaming.osy`, `Structured.osy` (extract, decide), `Budgets.osy`, `Meter.osy` (the meter and the price book),
   `Llm.osy` (the calls an app writes), `Scripted.osy` (the scripted model)

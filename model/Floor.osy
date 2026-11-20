@@ -126,6 +126,33 @@ internal bool OrgPolicyAdmits(LlmWalk walk, LlmAdmission admission, LlmModel mod
   return true;
 }
 
+/// Whether a model request with tools comes only from the agents kit — `LlmSetup.ToolsOnlyThroughAgents`, as this call
+/// reads it. Top-level so a test can say what an organisation set: `ToolsOnlyThroughAgentsInForce.Stub(() => true);`.
+/// Answered to whoever may call a model.
+[Authorize(UsesModels)]
+public bool ToolsOnlyThroughAgentsInForce() { return App.Setting<LlmSetup>().ToolsOnlyThroughAgents; }
+
+/// ⭐ THE ORGANISATION'S LOCK ON AN APP'S OWN TOOL LOOP (ORGPOL OP-FP3b-2), before anything is routed, reserved or sent. A
+/// request with tools, under the lock, is refused unless the code that called this kit is the agents kit's own — read by
+/// the platform off the running frames (`OrgPolicy.CallerIs`), as egress and `runas` of an agent are decided: the
+/// package's stamped code, with no frame of the app's own between. A request without tools is never judged.
+///
+/// SECURITY-INVARIANT(a-model-request-with-tools-comes-only-from-the-agents-kit): every `CompleteWith` and `StreamWith`
+/// calls this first. Failure mode: an app writes its own agent loop — `Llm.Complete` with tools, then runs what the model
+/// asked for itself — so neither the agents' gate nor a proposal ever sees it, though the organisation locked tools to
+/// the kit. Do not decide on a name the caller hands in, on the namespace, or on the innermost package (that is this
+/// kit): only the platform's reading of who called. Guarded by tests/policy.test.osy
+/// `a_tool_request_from_app_code_is_refused_under_lock`, `a_request_without_tools_is_always_served` and
+/// `a_tool_request_is_served_when_the_lock_is_off`, the platform's ToolsOnlyThroughAgentsTests, and the agents kit's
+/// `the_kits_own_loop_runs_its_tools_under_the_lock`.
+internal void RequireToolsFromTheAgentsKit(LlmRequest request) {
+  if (request.Tools.Count == 0) { return; }
+  if (!ToolsOnlyThroughAgentsInForce()) { return; }
+  if (OrgPolicy.CallerIs("Osysharp.Agents")) { return; }
+  OrgPolicy.Refuse("Osysharp.Llm.LlmSetup.ToolsOnlyThroughAgents",
+    "a model request with tools from code outside Osysharp.Agents; give the work to an agent through the agents kit");
+}
+
 /// The call is refused: no candidate inside the organisation's model list served it.
 void RefuseOutsideTheList(string models) {
   OrgPolicy.Refuse("Osysharp.Llm.LlmSetup.AllowedModels", models);
