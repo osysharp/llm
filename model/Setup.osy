@@ -134,13 +134,13 @@ public class LlmSetup {
   /// prefix ending in `*` (`claude-haiku-*`). Compared exactly, case and all. Empty: any model. A candidate outside it
   /// is never sent — whatever the app's router ordered — and a call with no candidate inside it is refused
   /// (`PolicyRefused`, key `Osysharp.Llm.LlmSetup.AllowedModels`).
-  [OrgPolicy(OrgPolicyMode.Lock, Name = "Models a call may be sent to")] public string AllowedModels = "";
+  [OrgPolicy(OrgPolicyMode.Lock, Name = "Models a call may be sent to", Area = OrgPolicyArea.Models)] public string AllowedModels = "";
   /// ⭐ THE MOST TOKENS THE APP'S CALLS MAY USE IN ONE CALENDAR MONTH (UTC) — an organisation's range (ORGPOL OP-FP2):
   /// prompt, answer and cache tokens as the provider reports them, counted in `LlmOrgUsage`. A call that could take
   /// the month past it is refused before anything is sent (`PolicyRefused`, key `Osysharp.Llm.LlmSetup.MonthlyTokens`).
   /// Always the ceiling — never "0 means none" — so an app's own value is held inside the organisation's range; the
   /// default is as good as none.
-  [OrgPolicy(OrgPolicyMode.Range, Name = "Monthly model tokens")] public long MonthlyTokens = 9000000000000000000;
+  [OrgPolicy(OrgPolicyMode.Range, Name = "Monthly model tokens", Area = OrgPolicyArea.Models)] public long MonthlyTokens = 9000000000000000000;
   /// ⭐ A MODEL REQUEST WITH TOOLS ONLY FROM THE AGENTS KIT — an organisation's lock (ORGPOL OP-FP3b-2). When it is on, a
   /// call whose `LlmRequest.Tools` is not empty is refused (`PolicyRefused`, key
   /// `Osysharp.Llm.LlmSetup.ToolsOnlyThroughAgents`) unless the code asking is `Osysharp.Agents`'s own — never the app's,
@@ -149,5 +149,5 @@ public class LlmSetup {
   /// Not refused: a typed answer (`Llm.Extract`, `Llm.Decide`, `OutputSchemaJson`) or text the app acts on, and a direct
   /// call to the provider's host unless the organisation leaves that host to its provider kit. Off, until the
   /// organisation locks it on.
-  [OrgPolicy(OrgPolicyMode.Lock, Name = "Model tools only through agents")] public bool ToolsOnlyThroughAgents = false;
+  [OrgPolicy(OrgPolicyMode.Lock, Name = "Model tools only through agents", Area = OrgPolicyArea.Agents)] public bool ToolsOnlyThroughAgents = false;
 }
