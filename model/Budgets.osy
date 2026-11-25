@@ -152,7 +152,7 @@ public entity LlmHold {
 
 /// The turnstile: reservations and settlements pass it one at a time, each holding it until its own commit, so two
 /// calls reserving at the same moment cannot both take the last of a budget's room — the second reads what the first
-/// left. Made and moved only by `PassTurnstile`.
+/// left. Made only by `MakeTurnstile` and moved only by `PassTurnstile`.
 public entity LlmTurnstile {
   [Unique, Immutable, MaxLength(40)] string Name;
   long Turn = 0;
@@ -162,13 +162,14 @@ public entity LlmTurnstile {
     allow read when ManagesModelSpend || ReadsModelUsage;
     allow read via PassTurnstile;
     allow create, update when UsesModels;
-    // SECURITY-INVARIANT(a-kits-throttle-is-written-only-by-the-kit): the turnstile is made and moved only by the kit's
-    // `PassTurnstile` (internal, so no request can name it), never by a request — a client, REST or MCP write, or
+    // SECURITY-INVARIANT(a-kits-throttle-is-written-only-by-the-kit): the turnstile is made only by the kit's
+    // `MakeTurnstile` and moved only by its `PassTurnstile` (both internal, so no request can name them), never by a
+    // request — a client, REST or MCP write, or
     // another function of the app or the kit. Failure mode: a caller who may call a model holds the row in a write of
     // their own, or makes rows of their own, and every reservation waits on them. Guarded by tests/budgets.test.osy
     // `a_signed_in_caller_cannot_make_or_move_the_turnstile` and Platform.Tests
     // `KitWritePathTests.AnExceptVia_PassesTheNamedFunctionsOwnSetBasedStatement_AndNoOneElses`.
-    deny create except via PassTurnstile;
+    deny create except via MakeTurnstile;
     deny update Turn except via PassTurnstile;
   }
 }
@@ -284,21 +285,25 @@ class LlmBudgetFor {
 }
 
 /// Wait this call's turn at the turnstile, and hold it until this unit of work commits. One statement: the database
-/// queues the callers, so nobody retries. The only code that makes or moves the turnstile; every reservation and
-/// settlement calls it, so whoever may call a model may pass.
+/// queues the callers, so nobody retries. The only code that moves the turnstile; every reservation and settlement
+/// calls it, so whoever may call a model may pass.
+///
+/// On an app's first call there is no turnstile yet, and the calls started together all find none: each asks
+/// `MakeTurnstile`, the one that makes it wins, the rest are refused by its [Unique] — and every one of them then passes.
+/// The making commits in a unit of work of its own, never this one, so this one commits only at its end and holds
+/// nothing but the turnstile.
 [Server, Authorize(UsesModels)]
 internal void PassTurnstile() {
   var passed = LlmTurnstile.Where(t => t.Name == "spend").Update(t => { t.Turn = t.Turn + 1; });
   if (passed > 0) { return; }
-  // The very first call of an app builds the turnstile; two that race to are settled by its declared [Unique].
-  try {
-    new LlmTurnstile { Name = "spend" };
-    UnitOfWork.Commit();
-  } catch (ValidationException e) {
-    UnitOfWork.Discard();
-  }
+  try { MakeTurnstile(); } catch (ValidationException e) { }
   LlmTurnstile.Where(t => t.Name == "spend").Update(t => { t.Turn = t.Turn + 1; });
 }
+
+/// Make the turnstile — on an app's first call, by `PassTurnstile` alone. Committed by itself, so the reservation that
+/// asked for it holds nothing of the making, and a racer refused by the turnstile's [Unique] leaves nothing behind.
+[Server, Authorize(UsesModels), CommitsAlone]
+internal void MakeTurnstile() { new LlmTurnstile { Name = "spend" }; }
 
 /// The budgets a call's scopes fall under, in one read: for each scope and window, the budget naming its subject, else
 /// the one for every subject of its kind.
@@ -343,9 +348,11 @@ internal LlmHoldResult HoldModelSpend(Guid call, string model, int maxConcurrent
   var budgets = BudgetsOf(scopes);
   if (budgets.Count == 0 && maxConcurrent == 0 && keyMaxConcurrent == 0 && limits.Count == 0) { return new LlmHoldResult(); }
 
+  // Read before the turnstile: the less its holder does behind it, the shorter every queued caller waits.
+  var holdFor = App.Setting<LlmSetup>().HoldFor;
   PassTurnstile();
   var now = DateTime.UtcNow;
-  var live = now - App.Setting<LlmSetup>().HoldFor;
+  var live = now - holdFor;
   // A hold nobody came back for — its process died mid-call — is released here, by whoever reserves next.
   foreach (var stale in LlmHold.Where(h => h.At < live).Take(50).ToList()) { stale.Delete(); }
 
